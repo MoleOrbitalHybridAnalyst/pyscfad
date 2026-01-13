@@ -69,8 +69,8 @@ def _scf_q_broyden(
 
     def safe_inv_norm(v):
         safe_v = np.where(np.abs(v) < 1e-8, 0., v)
-        norm_v = np.sqrt(np.sum(safe_v**2))
-        return 1 / (1e-12 + norm_v)
+        v2 = np.sum(safe_v**2)
+        return np.where(v2 > 1e-12, 1/np.sqrt(v2), 1.0)
 
     def cond_fun(value):
         cycle, de, norm_gorb = value[:3]
@@ -99,7 +99,7 @@ def _scf_q_broyden(
 
         A = np.eye(mf.max_cycle) - np.dot(v_hist.T, u_hist)
         b = np.dot(v_hist.T, g1)
-        x = np.linalg.solve(A, b)
+        x = np.dot(np.linalg.pinv(A, 1e-3), b)
 
         dq1 = g1 + np.dot(u_hist, x)
         q2 = normalize_tot_charge(
