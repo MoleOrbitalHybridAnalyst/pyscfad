@@ -477,7 +477,7 @@ class QMMM:
 
     def get_ovlp(self, *args):
         if self.s1 is None:
-            self.s1 = self.mol.intor('int1e_ovlp')
+            self.s1 = self.mol.intor('int1e_ovlp', hermi=1)
         return self.s1
 
     def get_qm_charges(self, dm, s1e=None):
@@ -496,7 +496,7 @@ class QMMM:
             self.s1r = list()
             mol = self.mol
             atm_to_ao_id = util.atom_to_ao_indices(mol)
-            s1r = mol.intor('int1e_r')  # (3, nao, nao)
+            s1r = mol.intor('int1e_r', hermi=1)  # (3, nao, nao)
             self.s1r = s1r - numpy.einsum(
                 'vx,uv->xuv',
                 mol.atom_coords()[atm_to_ao_id],
@@ -523,7 +523,7 @@ class QMMM:
             mol = self.mol
             nao = mol.nao_nr()
             atm_to_ao_id = util.atom_to_ao_indices(mol)
-            s1rr = mol.intor('int1e_rr').reshape(3, 3, nao, nao)
+            s1rr = mol.intor('int1e_rr', hermi=1).reshape(3, 3, nao, nao)
             s1r2 = numpy.einsum('xxuv->uv', s1rr)
             s1r = self.get_s1r()
             s1 = self.get_ovlp()
