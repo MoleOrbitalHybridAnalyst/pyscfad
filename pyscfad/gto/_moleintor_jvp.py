@@ -316,12 +316,19 @@ def _gen_int1e_jvp_r0(mol, mol_t, intor_a, intor_b,
 
 @jit
 def _gen_int1e_fill_jvp_r0(ints, coords_t, aoslices, aoidx):
-    def _fill(sl, coord_t):
-        mask = (aoidx >= sl[0]) & (aoidx < sl[1])
-        grad = np.where(mask, ints, np.array(0, dtype=ints.dtype))
-        return np.einsum('xyij,x->yij', grad, coord_t)
-    jvp = np.sum(vmap(_fill)(aoslices, coords_t), axis=0)
-    return jvp
+    # Each AO row/col belongs to exactly one atom, so the original
+    # vmap-with-mask formulation
+    #   out[y,i,j] = Σ_k Σ_x ints[x,y,i,j] · coords_t[k,x] · 𝟙[AO ∈ atom k]
+    # collapses to a single contraction once we precompute the per-AO atom map.
+    # The vmap version materializes (natm, *ints.shape), which OOMs for large Nao.
+    ao_axis = next(ax for ax, sz in enumerate(aoidx.shape) if sz > 1)
+    flat_idx = aoidx.reshape(-1)
+    atom_of_ao = (flat_idx[:, None] >= aoslices[:, 0][None, :]).sum(axis=-1) - 1
+    ao_coord_t = coords_t[atom_of_ao]
+    if ao_axis == 2:
+        return np.einsum('xyij,ix->yij', ints, ao_coord_t)
+    else:
+        return np.einsum('xyij,jx->yij', ints, ao_coord_t)
 
 def _int1e_r_jvp_r0(mol, mol_t, intor):
     coords_t = mol_t.coords

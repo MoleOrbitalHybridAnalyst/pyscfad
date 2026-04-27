@@ -856,24 +856,33 @@ class QMMM:
         GvR = numpy.einsum('gx,ix->ig', Gv, coords1)
         cosGvR = numpy.cos(GvR)
         sinGvR = numpy.sin(GvR)
+        GcG = numpy.einsum('gx,ig->igx', Gv, cosGvR)
+        GsG = numpy.einsum('gx,ig->igx', Gv, sinGvR)
+        GcGG = numpy.einsum('igx,g->igx', GcG, Gpref)
+        GsGG = numpy.einsum('igx,g->igx', GsG, Gpref)
 
         # qm pc - qm pc
         ewg00 = numpy.einsum('ig,jg,g->ij', cosGvR, cosGvR, Gpref)
         ewg00 += numpy.einsum('ig,jg,g->ij', sinGvR, sinGvR, Gpref)
         # qm pc - qm dip
-        ewg01 = numpy.einsum('gx,ig,jg,g->ijx', Gv, sinGvR, cosGvR, Gpref)
-        ewg01 -= numpy.einsum('gx,ig,jg,g->ijx', Gv, cosGvR, sinGvR, Gpref)
+#        ewg01 = numpy.einsum('gx,ig,jg,g->ijx', Gv, sinGvR, cosGvR, Gpref)
+#        ewg01 -= numpy.einsum('gx,ig,jg,g->ijx', Gv, cosGvR, sinGvR, Gpref)
+        ewg01 = numpy.einsum('igx,jg->ijx', GsGG, cosGvR)
+        ewg01 -= numpy.einsum('igx,jg->ijx', GcGG, sinGvR)
         # qm dip - qm dip
-        ewg11 = numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
-                             Gv, cosGvR, cosGvR, Gpref)
-        ewg11 += numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
-                              Gv, sinGvR, sinGvR, Gpref)
+#        ewg11 = numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
+#                             Gv, cosGvR, cosGvR, Gpref)
+#        ewg11 += numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
+#                              Gv, sinGvR, sinGvR, Gpref)
+        ewg11 = numpy.einsum('igx,jgy->ijxy', GcGG, GcG)
+        ewg11 += numpy.einsum('igx,jgy->ijxy', GsGG, GsG)
         # qm pc - qm quad
-        ewg02 = -numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
-                              Gv, cosGvR, cosGvR, Gpref)
-        ewg02 += -numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
-                               Gv, sinGvR, sinGvR, Gpref)
-        ewg02 /= 3
+#        ewg02 = -numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
+#                              Gv, cosGvR, cosGvR, Gpref)
+#        ewg02 += -numpy.einsum('gx,gy,ig,jg,g->ijxy', Gv,
+#                               Gv, sinGvR, sinGvR, Gpref)
+#        ewg02 /= 3
+        ewg02 = ewg11 / (-3.)
 
         return (ewself00 + ewg00)[util.atom_to_bas_indices_2d(self.mol)], \
             (ewself01 + ewg01)[util.atom_to_bas_indices(self.mol)], \
