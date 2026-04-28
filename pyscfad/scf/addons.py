@@ -32,30 +32,34 @@ def _fermi_entropy(mo_occ, occ_thresh=1e-10):
 
 def _fermi_smearing_occ(mu, mo_energy, sigma, mo_mask):
     de = (mo_energy - mu) / sigma
-    de = np.where(np.less(de, 40.), de, np.inf)
+    de = np.clip(de, -40., 40.)
     occ = 1. / (np.exp(de) + 1.)
     occ = np.where(mo_mask, occ, 0.)
     return occ
 
+_SMEARING_SOLVE_MU_MAX_ITER = 64
+
 @partial(custom_jvp, nondiff_argnums=(0, 3))
 def _smearing_solve_mu(f_occ, mo_es, nocc, sigma, mo_mask):
     def cond_fun(value):
-        _, nerr = value
-        return abs(nerr) > 1e-8
+        i, _, nerr = value
+        return (i < _SMEARING_SOLVE_MU_MAX_ITER) & (abs(nerr) > 1e-8) & np.isfinite(nerr)
 
     def body_fun(value):
         """One Halley step"""
-        mu, nerr = value
+        i, mu, _ = value
         occ = f_occ(mu, mo_es, sigma, mo_mask)
         grad = occ * (1.-occ) / sigma
         hess = grad * (1.-2*occ) / sigma
         nerr = np.sum(occ) - nocc
         grad = np.sum(grad)
         hess = np.sum(hess)
-        dmu = -nerr * grad / (grad**2 - .5 * hess * nerr)
-        return mu + dmu, nerr
+        denom = grad**2 - 0.5 * hess * nerr
+        denom = np.where(np.abs(denom) < 1e-30, grad**2 + 1e-30, denom)
+        dmu = -nerr * grad / denom
+        return i + 1, mu + dmu, nerr
 
-    mu, _ = while_loop(cond_fun, body_fun, (mo_es[nocc-1], 1e2))
+    _, mu, _ = while_loop(cond_fun, body_fun, (0, mo_es[nocc-1], 1e2))
     return mu
 
 @_smearing_solve_mu.defjvp
@@ -66,7 +70,11 @@ def _smearing_solve_mu_jvp(f_occ, sigma, primals, tangents):
     mu = _smearing_solve_mu(f_occ, mo_es, nocc, sigma, mo_mask)
     occ = f_occ(mu, mo_es, sigma, mo_mask)
     dndmu = occ * (1.-occ) / sigma
-    return mu, np.dot(dndmu, dmo_e) / np.sum(dndmu)
+    sum_dn = np.sum(dndmu)
+    safe_sum = np.where(sum_dn > 0., sum_dn, 1.)
+    dmu_tan = np.dot(dndmu, dmo_e) / safe_sum
+    dmu_tan = np.where(sum_dn > 0., dmu_tan, 0.)
+    return mu, dmu_tan
 
 def _smearing_optimize(f_occ, mo_es, nocc, sigma, mo_mask):
     mu = _smearing_solve_mu(f_occ, mo_es, nocc, sigma, mo_mask)
