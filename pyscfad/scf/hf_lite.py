@@ -108,6 +108,12 @@ def get_grad(mo_coeff: ArrayLike, mo_occ: ArrayLike, fock_ao: ArrayLike) -> Arra
     g = 2 * fock_mo * (vir_mask[:,None] * occ_mask[None,:])
     return g.ravel()
 
+def get_grad_tril(mo_coeff: ArrayLike, fock_ao: ArrayLike) -> Array:
+    fock_mo = mo_coeff.conj().T @ fock_ao @ mo_coeff
+    nmo = fock_mo.shape[-1]
+    i, j = numpy.tril_indices(nmo, -1)
+    return fock_mo[i, j]
+
 def update_dm(
     mf: SCF,
     h1e: ArrayLike,
@@ -440,6 +446,8 @@ class SCF(SCFBase):
         if fock is None:
             dm = self.make_rdm1(mo_coeff, mo_occ)
             fock = self.get_fock(dm=dm)
+        if self.sigma is not None and self.sigma > 0:
+            return get_grad_tril(mo_coeff, fock)
         return get_grad(mo_coeff, mo_occ, fock)
 
     def dip_moment(
