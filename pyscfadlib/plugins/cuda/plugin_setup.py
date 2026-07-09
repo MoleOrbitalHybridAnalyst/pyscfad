@@ -1,19 +1,3 @@
-# Copyright 2023 The JAX Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# Modified from JAX
-
 import importlib
 import os
 from setuptools import setup
@@ -40,6 +24,37 @@ class BinaryDistribution(Distribution):
   def has_ext_modules(self):
     return True
 
+def cuda_runtime_requirements(cuda_version):
+  """PyPI requirements for the CUDA runtime libraries the modules link against.
+
+  NVIDIA changed the package naming at CUDA 13: through CUDA 12 the real
+  libraries are suffixed (``nvidia-cublas-cu12``); from CUDA 13 on the suffixed
+  packages are empty deprecation stubs and the real libraries live under the
+  unsuffixed names.
+
+  For the unsuffixed names we pin each library to the major of its version so a
+  cuda13 wheel cannot resolve a library from a newer CUDA generation. Crucially,
+  only some packages version by the CUDA major: cuBLAS / cudart / nvJitLink
+  track it (13.x), while cuSOLVER and cuSPARSE keep their own independent
+  product versioning (12.x in the CUDA 13 line) -- pinning those to the CUDA
+  major instead would request a nonexistent ``>=13`` release. ``lib_major`` maps
+  each library to the version major shipped with this CUDA release.
+  """
+  if cuda_version < 13:
+    libs = ["nvidia-cublas", "nvidia-cuda-runtime", "nvidia-cusolver",
+            "nvidia-cusparse", "nvidia-nvjitlink"]
+    return [f"{name}-cu{cuda_version}" for name in libs]
+
+  lib_major = {
+      "nvidia-cublas": cuda_version,
+      "nvidia-cuda-runtime": cuda_version,
+      "nvidia-nvjitlink": cuda_version,
+      # Independent product versioning; revisit for CUDA majors past 13.
+      "nvidia-cusolver": 12,
+      "nvidia-cusparse": 12,
+  }
+  return [f"{name}>={major},<{major + 1}" for name, major in lib_major.items()]
+
 setup(
     name=project_name,
     version=__version__,
@@ -51,14 +66,11 @@ setup(
     packages=[package_name],
     python_requires=">=3.11",
     extras_require={
-      'with_cuda': [
-          "nvidia-cublas-cu12>=12.1.3.1",
-          "nvidia-cuda-nvcc-cu12>=12.6.85",
-          "nvidia-cuda-runtime-cu12>=12.1.105",
-          "nvidia-cusolver-cu12>=11.4.5.107",
-          "nvidia-cusparse-cu12>=12.1.0.106",
-          "nvidia-nvjitlink-cu12>=12.1.105",
-      ],
+      # CUDA runtime libraries, matched to the wheel's CUDA major version.
+      # The compiled modules link these (libcusolver.so.11 for cu12,
+      # libcusolver.so.12 for cu13, etc.); CI ships slim wheels that resolve
+      # them from these packages at runtime.
+      'with_cuda': cuda_runtime_requirements(cuda_version),
     },
     license="Apache-2.0",
     classifiers=[

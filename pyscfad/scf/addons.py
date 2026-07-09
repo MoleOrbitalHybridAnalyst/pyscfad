@@ -19,21 +19,18 @@ from pyscfad import numpy as np
 from pyscfad import scipy
 
 def _fermi_entropy(mo_occ, occ_thresh=1e-10):
-    occ = mo_occ / 2.0
+    occ = mo_occ.astype(np.float64) / 2.0
     thr = occ_thresh
-    occ_safe = np.where(np.logical_or(occ < thr, occ > 1 - thr), 0.5, occ)
+    _unsafe_mask = np.logical_or(occ < thr, occ > 1 - thr)
+    occ_safe = np.where(_unsafe_mask, 0.5, occ)
     ent_term = occ_safe * np.log(occ_safe) + (1 - occ_safe) * np.log(1 - occ_safe)
-
-    return -2 * np.where(
-        np.logical_or(occ < thr, occ > 1 - thr),
-        0.,
-        ent_term
-    ).sum()
+    return -2 * np.where(_unsafe_mask, 0., ent_term).sum().astype(np.floatx)
 
 def _fermi_smearing_occ(mu, mo_energy, sigma, mo_mask):
     de = (mo_energy - mu) / sigma
-    de = np.clip(de, -40., 40.)
-    occ = 1. / (np.exp(de) + 1.)
+    _safe_mask = de < 40.
+    de_safe = np.where(_safe_mask, de, 0.)
+    occ = np.where(_safe_mask, 1. / (np.exp(de_safe) + 1.), 0.)
     occ = np.where(mo_mask, occ, 0.)
     return occ
 
@@ -89,8 +86,9 @@ def get_occ_smearing(mo_energy, nocc, sigma, mo_mask, method="fermi"):
     else:
         raise NotImplementedError
 
+    mo_energy = mo_energy.astype(np.float64)
     _, mo_occ = _smearing_optimize(f_occ, mo_energy, nocc, sigma, mo_mask)
-    return mo_occ
+    return mo_occ.astype(np.floatx)
 
 def canonical_orth_(S, thr=1e-7):
     """Löwdin's canonical orthogonalization.

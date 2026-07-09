@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from typing import Any
     from pyscfad.typing import ArrayLike, Array
     from pyscfad.gto import MoleLite
+    from pyscfad.dft.rks import VXC
 
 def get_occ(
     mf: SCF,
@@ -64,7 +65,8 @@ def get_occ(
         mo_occ *= 2
     else:
         pick = (np.cumsum(mask) <= nocc) & mask
-        mo_occ = np.where(pick, 2., 0.)
+        mo_occ = np.zeros_like(pick, dtype=np.floatx)
+        mo_occ = np.where(pick, 2, mo_occ)
         if mf.verbose >= logger.DEBUG:
             e_homo = np.max(np.where(pick, mo_energy, -np.inf))
             e_lumo = np.min(np.where(mask & ~pick, mo_energy, np.inf))
@@ -116,10 +118,10 @@ def get_grad_tril(mo_coeff: ArrayLike, fock_ao: ArrayLike) -> Array:
 
 def update_dm(
     mf: SCF,
-    h1e: ArrayLike,
-    s1e: ArrayLike,
-    vhf: ArrayLike,
-    dm: ArrayLike,
+    h1e: Array,
+    s1e: Array,
+    vhf: Array,
+    dm: Array,
     cycle: int,
     diis: Any,
     fock: ArrayLike,
@@ -157,10 +159,10 @@ def update_dm(
 
 def _scf(
     mf: SCF,
-    dm: ArrayLike,
-    h1e: ArrayLike,
-    s1e: ArrayLike,
-    vhf: ArrayLike,
+    dm: Array,
+    h1e: Array,
+    s1e: Array,
+    vhf: Array,
     e_tot: float,
     conv_tol: float,
     conv_tol_grad: float,
@@ -191,10 +193,10 @@ def _scf(
 
 def _scf_implicit(
     mf: SCF,
-    dm: ArrayLike,
-    h1e: ArrayLike,
-    s1e: ArrayLike,
-    vhf: ArrayLike,
+    dm: Array,
+    h1e: Array,
+    s1e: Array,
+    vhf: Array,
     e_tot: float,
     conv_tol: float,
     conv_tol_grad: float,
@@ -246,7 +248,10 @@ def kernel(
     if dm0 is None:
         dm = mf.get_init_guess(mol, mf.init_guess, s1e=s1e)
     else:
-        dm = dm0
+        dm = np.asarray(dm0)
+
+    if not np.iscomplexobj(dm):
+        dm = np.asarray(dm, dtype=np.floatx)
 
     h1e = mf.get_hcore(mol, s1e=s1e)
     vhf = mf.get_veff(mol, dm, s1e=s1e)
@@ -337,6 +342,11 @@ class SCF(SCFBase):
 
         self._eri = None
         self.scf_summary = {}
+
+    def get_ovlp(self, mol: MoleLite | None = None) -> Array:
+        if mol is None:
+            mol = self.mol
+        return mol.intor_symmetric("int1e_ovlp").astype(np.floatx)
 
     def dump_flags(self, verbose: int | None = None):
         pass
@@ -478,9 +488,9 @@ class SCF(SCFBase):
         coords  = np.asarray(mol.atom_coords())
 
         if origin is None:
-            origin = np.zeros(3)
+            origin = np.zeros(3, dtype=np.floatx)
         else:
-            origin = np.asarray(origin, dtype=float)
+            origin = np.asarray(origin, dtype=np.floatx)
 
         with mol.with_common_orig(origin):
             ao_dip = mol.intor_symmetric("int1e_r", comp=3)
@@ -499,9 +509,9 @@ class SCF(SCFBase):
 
     def energy_elec(
         self,
-        dm: ArrayLike | None = None,
-        h1e: ArrayLike | None = None,
-        vhf: ArrayLike | None = None,
+        dm: Array | None = None,
+        h1e: Array | None = None,
+        vhf: Array | VXC | None = None,
     ) -> tuple[float, float]:
         if dm is None:
             dm = self.make_rdm1()
@@ -526,6 +536,7 @@ class SCF(SCFBase):
     get_veff = hf.SCF.get_veff
     energy_nuc = hf.SCF.energy_nuc
     _eigh = hf.SCF._eigh
+    eig = hf.SCF.eig
     get_occ = get_occ
     get_homo_lumo_energy = get_homo_lumo_energy
 
