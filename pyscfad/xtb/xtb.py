@@ -152,6 +152,18 @@ class XTB(ABC, SCFLite):
     def tot_electrons(self) -> int:
         return tot_valence_electrons(self.mol)
 
+    @property
+    def tot_charge(self) -> float:
+        """Target sum of the shell charges."""
+        return self.mol.charge
+
+    def mask_ao_pairs(self, a: Array) -> Array:
+        """Scale AO-pair quantities (last two axes) consistently with the overlap.
+
+        Identity for regular XTB; overridden by alchemical methods.
+        """
+        return a
+
     def dip_moment(
         self,
         mol: MoleLite | None = None,

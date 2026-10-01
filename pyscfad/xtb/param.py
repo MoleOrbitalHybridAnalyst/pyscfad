@@ -29,7 +29,12 @@ from pyscfad.xtb.data.radii import COV_D3
 DefaultParamFile = os.path.join(os.path.dirname(__file__), "data/gfn1-xtb.toml")
 
 
-def cn_d3(mol, charges=None, coords=None, kcn=16.0, cov_radii=None):
+def cn_d3(mol, charges=None, coords=None, kcn=16.0, cov_radii=None, weights=None):
+    """D3 coordination numbers.
+
+    ``weights`` (natm,) optionally scales the contribution of each neighbor atom,
+    e.g., for alchemical atoms.
+    """
     if charges is None:
         charges = mol.atom_charges()
     if coords is None:
@@ -49,6 +54,9 @@ def cn_d3(mol, charges=None, coords=None, kcn=16.0, cov_radii=None):
     if hasattr(mol, "atom_mask"):
         mask = np.outer(mol.atom_mask, mol.atom_mask)
         CN = np.where(mask, CN, 0)
+
+    if weights is not None:
+        CN = CN * weights
 
     if CN.ndim == 2:
         axis = 1
@@ -188,7 +196,7 @@ class GFN1MolParam(pytree.PytreeNode):
         "dipgam",
         "quadgam"
     ]
-    def __init__(self, mol, param): # pylint: disable=redefined-outer-name
+    def __init__(self, mol, param, cn_weights=None): # pylint: disable=redefined-outer-name
         self.EN   = util.load_unique_element_params(mol, param, "en", broadcast="atom")
         self.gam  = util.load_unique_element_params(mol, param, "gam", broadcast="shell")
         self.gam3 = util.load_unique_element_params(mol, param, "gam3", broadcast="atom")
@@ -209,7 +217,7 @@ class GFN1MolParam(pytree.PytreeNode):
 
         self.kf = param.kf
         self.kEN = param.kEN
-        self.CN = cn_d3(mol, kcn=param.kcn_d3)
+        self.CN = cn_d3(mol, kcn=param.kcn_d3, weights=cn_weights)
 
         self.dipgam = None
         self.quadgam = None

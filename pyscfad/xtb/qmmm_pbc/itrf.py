@@ -956,7 +956,8 @@ class QMMM:
 
     def get_ovlp(self, *args):
         if self.s1 is None:
-            self.s1 = self.mol.intor('int1e_ovlp', hermi=1).astype(np.floatx)
+            self.s1 = self.mask_ao_pairs(
+                self.mol.intor('int1e_ovlp', hermi=1).astype(np.floatx))
         return self.s1
 
     def get_qm_charges(self, dm, s1e=None):
@@ -974,7 +975,10 @@ class QMMM:
             self.s1r = list()
             mol = self.mol
             atm_to_ao_id = util.atom_to_ao_indices(mol)
-            s1r = mol.intor('int1e_r', hermi=1).astype(np.floatx)  # (3, nao, nao)
+            # NOTE AO-pair masking commutes with the (u,v)-elementwise shifts below,
+            # so s1r and s1rr stay consistent with the masked overlap
+            s1r = self.mask_ao_pairs(
+                mol.intor('int1e_r', hermi=1).astype(np.floatx))  # (3, nao, nao)
             self.s1r = s1r - np.einsum(
                 'vx,uv->xuv',
                 mol.atom_coords()[atm_to_ao_id],
@@ -998,7 +1002,8 @@ class QMMM:
             mol = self.mol
             nao = mol.nao_nr()
             atm_to_ao_id = util.atom_to_ao_indices(mol)
-            s1rr = mol.intor('int1e_rr', hermi=1).reshape(3, 3, nao, nao).astype(np.floatx)
+            s1rr = self.mask_ao_pairs(
+                mol.intor('int1e_rr', hermi=1).reshape(3, 3, nao, nao).astype(np.floatx))
             s1r2 = np.einsum('xxuv->uv', s1rr)
             s1r = self.get_s1r()
             s1 = self.get_ovlp()
