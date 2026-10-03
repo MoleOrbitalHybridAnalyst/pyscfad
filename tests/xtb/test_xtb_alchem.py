@@ -60,11 +60,11 @@ def _ref_energy(basis, param, numbers, coords, charge, qmmm_fn=None):
         return mf.kernel()
     return energy()
 
-def _make_alchem_energy(basis, param, numbers, diis=None, qmmm_fn=None):
+def _make_alchem_energy(basis, param, numbers, diis=None, qmmm_fn=None, **alchem_kwargs):
     def energy(coords, lam):
         mol = Mole(numbers=numbers, coords=coords, basis=basis, charge=1, verbose=0,
                    trace_coords=True)
-        mf = AlchemGFN1XTB(mol, param, lam=lam, alchem_atoms=(3,))
+        mf = AlchemGFN1XTB(mol, param, lam=lam, alchem_atoms=(3,), **alchem_kwargs)
         if qmmm_fn is not None:
             mf = qmmm_fn(mf)
         mf.diis = diis
@@ -92,6 +92,24 @@ def test_alchem_proton_endpoints_and_grad(setup):
         assert abs(energy(coords, 0.) - e_h2o) < 1e-8
         assert abs(energy(coords, 1.) - e_h3o) < 1e-8
         _check_grads(energy, grad, coords)
+
+def test_alchem_proton_separate_penalty_switch(setup):
+    basis, param, numbers, coords = setup
+
+    # default penalty switch is 1 - onsite
+    e_default, _ = _make_alchem_energy(basis, param, numbers, penalty=.5)
+    e_explicit, _ = _make_alchem_energy(basis, param, numbers, penalty=.5,
+                                        switch={"penalty": lambda x: 1 - x})
+    assert abs(e_default(coords, .3) - e_explicit(coords, .3)) < 1e-12
+
+    # separate on-site scaling g and penalty weight p keep exact endpoints
+    switch = {"onsite": lambda x: x * x, "penalty": lambda x: (1 - x)**2}
+    energy, grad = _make_alchem_energy(basis, param, numbers, penalty=.5, switch=switch)
+    e_h2o = _ref_energy(basis, param, numbers[:3], coords[:3], 0)
+    e_h3o = _ref_energy(basis, param, numbers, coords, 1)
+    assert abs(energy(coords, 0.) - e_h2o) < 1e-8
+    assert abs(energy(coords, 1.) - e_h3o) < 1e-8
+    _check_grads(energy, grad, coords)
 
 def test_alchem_proton_qmmm_multipoles(setup, mm_setup):
     basis, param, numbers, coords = setup

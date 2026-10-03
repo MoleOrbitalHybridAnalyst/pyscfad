@@ -24,7 +24,9 @@ The following quantities are switched by ``lam``:
 
 * ``ovlp``: AO overlap between an alchemical atom and any other atom
   (this also scales the corresponding hcore elements, and QM/MM multipole integrals);
-* ``onsite``: on-site hcore block of alchemical atoms, interpolated to ``penalty``;
+* ``onsite`` (g) and ``penalty`` (p): on-site hcore block of alchemical atoms,
+  ``g(lam) * K + p(lam) * penalty`` with ``K`` the physical on-site factor
+  (``p`` defaults to ``1 - g``, i.e., interpolation between ``penalty`` and ``K``);
 * ``charge``: reference shell occupations (the "nuclear" part of the Mulliken charges);
 * ``rep``: effective nuclear charges in the repulsion energy;
 * ``cn``: contribution of alchemical atoms to the coordination numbers.
@@ -54,7 +56,10 @@ if TYPE_CHECKING:
     from pyscfad.gto import MoleLite
     from pyscfad.xtb.param import GFN1Param
 
-SWITCH_KEYS = ("ovlp", "onsite", "charge", "rep", "cn")
+SWITCH_KEYS = ("ovlp", "onsite", "penalty", "charge", "rep", "cn")
+
+def _linear(x):
+    return x
 
 class AlchemGFN1XTB(GFN1XTB):
     """GFN1-XTB with alchemical bare protons.
@@ -66,8 +71,13 @@ class AlchemGFN1XTB(GFN1XTB):
         alchem_atoms: Indices of the alchemical atoms.
         penalty: On-site orbital energy (Eh) of the alchemical AOs at ``lam=0``.
             It only needs to keep those orbitals above the Fermi level.
-        switch: Optional mapping from the keys ``ovlp``, ``onsite``, ``charge``,
-            ``rep`` and ``cn`` to switching functions ``s(lam)``. Defaults to linear.
+        switch: Optional mapping from the keys ``ovlp``, ``onsite``, ``penalty``,
+            ``charge``, ``rep`` and ``cn`` to switching functions ``s(lam)``.
+            All default to linear, except ``penalty``, which defaults to
+            ``1 - onsite(lam)``. The on-site block of the alchemical atoms is
+            ``onsite(lam) * K + penalty(lam) * penalty``; for exact decoupling at
+            ``lam=0`` and the physical block at ``lam=1``, use ``onsite(0) = 0``,
+            ``onsite(1) = 1``, ``penalty(0) = 1`` and ``penalty(1) = 0``.
 
     Notes:
         All ``lam``-dependent quantities are built at construction;
@@ -93,7 +103,9 @@ class AlchemGFN1XTB(GFN1XTB):
         self.lam = lam
         self.alchem_atoms = tuple(int(i) for i in alchem_atoms)
         self.penalty = penalty
-        s = {k: switch.get(k, lambda x: x)(lam) for k in SWITCH_KEYS}
+        onsite = switch.get("onsite", _linear)
+        defaults = {"penalty": lambda x: 1 - onsite(x)}
+        s = {k: switch.get(k, defaults.get(k, _linear))(lam) for k in SWITCH_KEYS}
         self._switch_values = s
 
         alch_atm = numpy.zeros(mol.natm, dtype=bool)
@@ -131,8 +143,9 @@ class AlchemGFN1XTB(GFN1XTB):
 
     def _get_EHT_factor(self, mol: MoleLite | None = None) -> Array:
         h1 = super()._get_EHT_factor(mol)
-        s = self._switch_values["onsite"]
-        return np.where(self._onsite_mask, s * h1 + (1 - s) * self.penalty, h1)
+        g = self._switch_values["onsite"]
+        p = self._switch_values["penalty"]
+        return np.where(self._onsite_mask, g * h1 + p * self.penalty, h1)
 
     def dip_moment(
         self,
