@@ -16,4 +16,5 @@
 XTB
 """
 from .xtb_pad import GFN1XTB
+from .kxtb_pad import GFN1KXTB
 from .param import make_param_array

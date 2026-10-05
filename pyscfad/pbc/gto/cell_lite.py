@@ -57,7 +57,7 @@ class Cell(MoleLite):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.a = np.asarray(a, dtype=float).reshape(3,3)
+        self.a = np.asarray(a, dtype=np.floatx).reshape(3,3)
         self.precision = precision
         self.dimension = dimension
 
@@ -82,7 +82,7 @@ class Cell(MoleLite):
 
     @Ls.setter
     def Ls(self, val: ArrayLike):
-        self._Ls = np.asarray(val, dtype=np.float64).reshape(-1,3)
+        self._Ls = np.asarray(val, dtype=np.floatx).reshape(-1,3)
 
     def get_Ls_mask(
         self,
@@ -142,8 +142,8 @@ class Cell(MoleLite):
         out = _pbc_intor(
             intor_name, self.a, kpts, self.rcut,
             self._atm, self._bas, self._env,
+            self.r0, self.exp, self.ctr_coeff,
             shls_slice=shls_slice, comp=comp, hermi=hermi,
-            trace_coords=self.trace_coords, trace_basis=self.trace_basis,
             dimension=self.dimension,
         )
         return out
@@ -183,15 +183,15 @@ class Cell(MoleLite):
             out = _latintor._lattice_intor(
                 intor_name, Ls, Ls_mask,
                 self._atm, self._bas, self._env,
+                self.r0, self.exp, self.ctr_coeff,
                 shls_slice=shls_slice, comp=comp, hermi=hermi,
-                trace_coords=self.trace_coords, trace_basis=self.trace_basis,
             )
         else:
             out = latintor_cuint._lattice_intor(
                 intor_name, Ls, Ls_mask,
                 self._atm, self._bas, self._env, cuint_plan,
+                self.r0, self.exp, self.ctr_coeff,
                 shls_slice=shls_slice, comp=comp, hermi=hermi,
-                trace_coords=self.trace_coords, trace_basis=self.trace_basis,
             )
         return out
 

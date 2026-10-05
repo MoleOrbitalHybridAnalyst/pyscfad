@@ -29,13 +29,16 @@ from pyscf.scf.hf import (
 )
 
 from pyscfad import numpy as np
+from pyscfad import ops
 from pyscfad import lib
 from pyscfad.lib import logger
+from pyscfad.lib.diis_lite import DIISLite
 from pyscfad.scf import hf
 from pyscfad.scf.anderson import Anderson
 #from pyscfad.tools.linear_solver import gen_gmres
 from pyscfad.scipy.sparse.linalg import gmres_const_atol
 from pyscfad.scf.addons import get_occ_smearing
+from pyscfad.scf.diis_lite import CDIIS
 
 if TYPE_CHECKING:
     from typing import Any
@@ -178,13 +181,18 @@ def _scf(
         return cycle+1, de, norm_gorb, dm, vhf, fock, e_tot, diis
 
     fock = mf.get_fock(h1e, s1e, vhf, dm)
-    if isinstance(mf.diis, str) and mf.diis.lower() == "anderson":
-        diis = Anderson(
-            lib.pack_tril(fock),
-            space=mf.diis_space,
-            damp=mf.diis_damp,
-            start_cycle=mf.diis_start_cycle
-        )
+    if isinstance(mf.diis, str):
+        if mf.diis.lower() == "anderson":
+            diis = Anderson(
+                lib.pack_tril(fock),
+                space=mf.diis_space,
+                damp=mf.diis_damp,
+                start_cycle=mf.diis_start_cycle
+            )
+        elif mf.diis.lower() in ("diis", "cdiis"):
+            diis = CDIIS(fock, space=mf.diis_space)
+    elif isinstance(mf.diis, DIISLite):
+        diis = mf.diis
     else:
         diis = None
     init_val = (0, e_tot, 1e3, dm, vhf, fock, e_tot, diis)
@@ -306,6 +314,102 @@ def kernel(
     del log
     return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
 
+def _pair_index(n: int) -> Array:
+    """Packed index ``max(i,j)*(max(i,j)+1)//2 + min(i,j)`` of every
+    ``(i, j)``, i.e. the inverse of :func:`numpy.tril_indices`.
+
+    Built with array ops rather than as a constant: the pair-of-pairs map of
+    an ``s8`` array has ``nao_pair**2`` entries.
+    """
+    idx = np.arange(n)
+    hi = np.maximum(idx[:,None], idx)
+    lo = np.minimum(idx[:,None], idx)
+    return hi*(hi+1)//2 + lo
+
+def _dot_eri_dm_s4(eri, dm, with_j, with_k):
+    r"""``vj`` and ``vk`` from the pair-packed integrals
+    ``eri4[ij,kl] = (ij|kl)``, ``i>=j``, ``k>=l``.
+
+    The Coulomb term stays in the pair basis: the two orderings of a bra
+    pair see the same integral, so with ``dmt[ij] = dm[i,j] + dm[j,i]``
+    (``dm[i,i]`` on the diagonal), ``vj[kl] = sum_ij eri4[ij,kl] dmt[ij]``,
+    a matrix-vector product over the pair index.
+
+    The exchange term contracts one index of the bra pair with one of the
+    ket pair, which the pair basis cannot express. Unpacking the ket pair
+    only, ``m[ij,k,l] = (ij|kl)``, the two orderings of a bra pair
+    contribute to different rows,
+
+    - ``vk[i,l] += sum_k m[ij,k,l] dm[j,k]``
+    - ``vk[j,l] += sum_k m[ij,k,l] dm[i,k]``, for ``i != j`` only,
+
+    so ``vk`` is two contractions over ``k`` followed by a scatter over the
+    pair index. The largest intermediate is ``nao_pair*nao**2``, half of the
+    unpacked ``(nao,)*4`` tensor.
+    """
+    nao = dm.shape[-1]
+    nao_pair = nao * (nao+1) // 2
+    dms = dm.reshape(-1, nao, nao)
+    pair = _pair_index(nao)
+    eri4 = eri.reshape(nao_pair, nao_pair)
+    i, j = numpy.tril_indices(nao)
+    diag = i == j
+
+    vj = vk = None
+    if with_j:
+        dmt = dms[:,i,j] + dms[:,j,i]
+        # the diagonal pair is not doubled
+        dmt = dmt * np.asarray(numpy.where(diag, .5, 1.), dtype=dmt.dtype)
+        vj = (dmt @ eri4)[:,pair].reshape(dm.shape)
+
+    if with_k:
+        m = eri4[:,pair]
+        ki = np.einsum("pkl,xpk->xpl", m, dms[:,j,:])
+        kj = np.einsum("pkl,xpk->xpl", m, dms[:,i,:])
+        kj = kj * np.asarray(~diag, dtype=kj.dtype)[:,None]
+        vk = np.zeros(dms.shape, dtype=ki.dtype)
+        vk = ops.index_add(vk, ops.index[:,i], ki)
+        vk = ops.index_add(vk, ops.index[:,j], kj)
+        vk = vk.reshape(dm.shape)
+    return vj, vk
+
+def _dot_eri_dm_s8(eri, dm, with_j, with_k):
+    """``vj`` and ``vk`` from the ``s8``-packed unique integrals.
+
+    The ``s8`` array is the lower triangle of the ``s4`` matrix over the
+    pair index, so restoring that matrix leaves :func:`_dot_eri_dm_s4`.
+    """
+    nao = dm.shape[-1]
+    nao_pair = nao * (nao+1) // 2
+    return _dot_eri_dm_s4(eri[_pair_index(nao_pair)], dm, with_j, with_k)
+
+def dot_eri_dm(eri, dm, hermi=0, with_j=True, with_k=True):
+    """Contract the AO integrals with the density matrix.
+
+    ``eri`` is the full ``(nao,)*4`` tensor (``aosym='s1'``), the
+    ``(nao_pair, nao_pair)`` matrix of the pair-packed integrals
+    (``aosym='s4'``), or the unique integrals of the 8-fold permutation
+    symmetry (``aosym='s8'``), as returned by
+    :meth:`~pyscfad.gto.MoleLite.intor`.
+
+    ``hermi`` is accepted for signature compatibility; every branch is
+    exact for a general density matrix.
+    """
+    dm = np.asarray(dm)
+    nao = dm.shape[-1]
+    nao_pair = nao * (nao+1) // 2
+    if np.iscomplexobj(eri) or eri.size == nao**4:
+        vj, vk = hf._dot_eri_dm_s1(eri, dm, with_j, with_k)
+    elif eri.size == nao_pair**2:
+        vj, vk = _dot_eri_dm_s4(eri, dm, with_j, with_k)
+    elif eri.size == nao_pair * (nao_pair+1) // 2:
+        vj, vk = _dot_eri_dm_s8(eri, dm, with_j, with_k)
+    else:
+        raise NotImplementedError(
+            f"eri of size {eri.size} is not a s1, s4 or s8 integral array "
+            f"of {nao} orbitals")
+    return vj, vk
+
 class SCF(SCFBase):
     r"""Molecular SCF (mean-field) methods.
 
@@ -313,7 +417,7 @@ class SCF(SCFBase):
         mol: Molecular information.
 
     Attributes:
-        diis: SCF solver. Default uses the Anderson mixing.
+        diis: SCF solver. Default uses CDIIS, and can also be Anderson mixing.
         use_sp2: Whether to use the SP2 density purification solver.
         conv_tol_dm: Convergence threshold used for the SP2 solver.
         sigma: Smearning temperature :math:`k_B T` in Eh.
@@ -321,7 +425,7 @@ class SCF(SCFBase):
             Only Fermi-Dirac (``fermi``) distribution is supported.
         veff_with_ecoul: Whether ``get_veff`` returns a :class:`~pyscfad.dft.rks.VXC` object.
     """
-    diis: Any | None = None
+    diis: str | DIISLite | None = "cdiis"
     use_sp2: bool = False
     conv_tol_dm: float | None = None
     sigma: float | None = None
@@ -383,17 +487,20 @@ class SCF(SCFBase):
 
     def get_fock(
         self,
-        h1e: ArrayLike | None = None,
-        s1e: ArrayLike | None = None,
-        vhf: ArrayLike | None = None,
-        dm: ArrayLike | None = None,
+        h1e: Array | None = None,
+        s1e: Array | None = None,
+        vhf: Any | None = None,
+        dm: Array | None = None,
         cycle: int = -1,
         diis: Any | None = None,
         diis_start_cycle: int | None = None,
         level_shift_factor: float | None = None,
         damp_factor: float | None = None,
-        fock_last: ArrayLike | None = None,
+        fock_last: Array | None = None,
     ) -> Array:
+        del cycle, diis_start_cycle, level_shift_factor, damp_factor
+        if s1e is None:
+            s1e = self.get_ovlp()
         if h1e is None:
             h1e = self.get_hcore()
         if vhf is None:
@@ -402,12 +509,16 @@ class SCF(SCFBase):
         # hack for DFT
         vhf = getattr(vhf, "vxc", vhf)
         f = h1e + vhf
+
         if diis is None:
             pass
 
         elif isinstance(diis, Anderson):
             f_tril = diis.update(lib.pack_tril(f), lib.pack_tril(fock_last))
             f = lib.unpack_tril(f_tril)
+
+        elif isinstance(diis, CDIIS):
+            f = diis.update(s1e, dm, f, f_prev=fock_last)
 
         else:
             raise NotImplementedError(f"Unsupported diis type {type(diis)}")
@@ -531,8 +642,40 @@ class SCF(SCFBase):
         logger.debug(self, "E1 = %s  E_coul = %s", e1, ecoul)
         return e1+ecoul, ecoul
 
-    get_init_guess = hf.SCF.get_init_guess
-    get_jk = hf.SCF.get_jk
+    def get_init_guess(
+        self,
+        mol: MoleLite | None = None,
+        key: str = "minao",
+        **kwargs,
+    ) -> Array:
+        dm = super().get_init_guess(mol=mol, key=key, **kwargs)
+        dm = np.asarray(dm)
+        return dm
+
+    def get_jk(
+        self,
+        mol: MoleLite | None = None,
+        dm: Array | None = None,
+        hermi: int = 1,
+        with_j: bool = True,
+        with_k: bool = True,
+        omega: float | None = None,
+    ) -> tuple[Array, Array]:
+        if mol is None:
+            mol = self.mol
+        if dm is None:
+            dm = self.make_rdm1()
+
+        if self._eri is None:
+            self._eri = mol.intor("int2e", aosym="s8")
+        if omega:
+            raise NotImplementedError
+        else:
+            _eri = np.asarray(self._eri, dtype=np.floatx)
+
+        vj, vk = dot_eri_dm(_eri, dm, hermi, with_j, with_k)
+        return vj, vk
+
     get_veff = hf.SCF.get_veff
     energy_nuc = hf.SCF.energy_nuc
     _eigh = hf.SCF._eigh

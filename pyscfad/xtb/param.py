@@ -29,7 +29,7 @@ from pyscfad.xtb.data.radii import COV_D3
 DefaultParamFile = os.path.join(os.path.dirname(__file__), "data/gfn1-xtb.toml")
 
 
-def cn_d3(mol, charges=None, coords=None, kcn=16.0, cov_radii=None, weights=None):
+def cn_d3(mol, charges=None, coords=None, kcn=16.0, cov_radii=None, Ls=None, weights=None):
     """D3 coordination numbers.
 
     ``weights`` (natm,) optionally scales the contribution of each neighbor atom,
@@ -42,9 +42,15 @@ def cn_d3(mol, charges=None, coords=None, kcn=16.0, cov_radii=None, weights=None
     if cov_radii is None:
         cov_radii = COV_D3[charges]
 
-    Ls = None
-    if isinstance(mol, pbcgto.Cell):
-        Ls = mol.get_lattice_Ls()
+    if Ls is None:
+        if isinstance(mol, pbcgto.Cell):
+            Ls = mol.get_lattice_Ls()
+        else:
+            # lite/padded cells carry a fixed-shape image grid (jit safe)
+            try:
+                Ls = getattr(mol, "Ls", None)
+            except RuntimeError:  # CellLite.Ls raises when nimgs is unset
+                Ls = None
 
     RAB = cov_radii[:,None] + cov_radii[None,:]
     r = inter_distance(coords=coords, Ls=Ls)

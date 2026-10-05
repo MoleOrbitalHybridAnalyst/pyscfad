@@ -1,4 +1,4 @@
-# Copyright 2021-2025 The PySCFAD Authors
+# Copyright 2025-2026 The PySCFAD Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+from typing import NamedTuple
 
 import dataclasses
 import numpy
@@ -22,14 +23,15 @@ from pyscf.lib.exceptions import BasisNotFoundError
 from pyscf.gto import basis as pyscf_basis
 from pyscf.gto.basis import parse_nwchem
 from pyscf.gto.basis.parse_nwchem import search_seg, _parse
-from pyscf.gto.mole import BAS_SLOTS, NORMALIZE_GTO
+from pyscf.gto.mole import BAS_SLOTS, NORMALIZE_GTO, PTR_COEFF
 from pyscf.data.elements import _symbol
 
 from pyscfad.typing import Array
 from pyscfad import numpy as np
+from pyscfad import ops
 from pyscfad.gto.mole_lite import _parse_default_basis, _format_basis
 
-# NOTE Monkey patch
+# FIXME Monkey patch
 def _load_external(module, filename_or_basisname, symb, **kwargs):
     try:
         return module.load(filename_or_basisname, symb, **kwargs)
@@ -44,12 +46,24 @@ def load(basisfile, symb, optimize=True):
     return _parse(raw_basis, optimize)
 parse_nwchem.load = load
 
+class BasisArrayMetadata(NamedTuple):
+    """Metadata for :class:`BasisArray`.
+    """
+    ls: tuple
+    l_loc: tuple
+    nprim: int
+    nctr: int
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass
 class BasisArray:
     """Basis set stored in an array, padded to make
     each element type have the same numbers of shells,
     primitives and contractions.
+
+    The padding slots (where ``mask_data`` is False) hold placeholders that
+    enter no integral, and :func:`make_bas_env` freezes them, so derivatives
+    with respect to them are exactly zero.
     """
     data: Array
     mask_shl: Array
@@ -57,6 +71,7 @@ class BasisArray:
     mask_data: Array
     ls: numpy.ndarray = dataclasses.field(metadata={"static": True})
     l_loc: numpy.ndarray = dataclasses.field(metadata={"static": True})
+    nprim: numpy.int32 = dataclasses.field(metadata={"static": True})
     nctr: numpy.int32 = dataclasses.field(metadata={"static": True})
 
     def make_bas_env(self, ptr: int=0):
@@ -71,7 +86,7 @@ class BasisArray:
     def make_ao_mask(self, mask_shl, mask_ctr, cart=False):
         return make_ao_mask(self, mask_shl=mask_shl, mask_ctr=mask_ctr, cart=cart)
 
-    def nao_nr(self, cart=False):
+    def nao_nr(self, cart: bool = False) -> int:
         """Number of atomic orbitals per element (non-relativistic).
         """
         ls = self.ls
@@ -81,11 +96,21 @@ class BasisArray:
             return numpy.sum(2*ls+1) * self.nctr
 
     @property
-    def nbas(self):
+    def nbas(self) -> int:
         """Number of shells per element.
         """
         return len(self.ls)
 
+    @property
+    def metadata(self) -> BasisArrayMetadata:
+        """Static metadata.
+        """
+        return BasisArrayMetadata(
+            ls=tuple(self.ls.tolist()),
+            l_loc=tuple(self.l_loc.tolist()),
+            nprim=int(self.nprim),
+            nctr=int(self.nctr),
+        )
 
 def gaussian_int(n, alpha):
     from jax.scipy.special import gamma
@@ -107,13 +132,24 @@ def _nomalize_contracted_ao(l, es, cs):
 def make_bas_env(
     basis: BasisArray,
     ptr: int = 0,
-) -> tuple[Array, Array]:
-    _bas = []
-    _env = []
+) -> tuple[Array, Array, Array, Array]:
+    bas = []
     # TODO kappa
     kappa = 0
+    exp = []
+    ctr_coeff = []
+    ptr_exp0 = ptr
+    ptr_coeff0 = 0
 
-    data = basis.data
+    # Padding entries (``mask_data`` False) carry a zero contraction
+    # coefficient, and an exponent repeating the shell's most diffuse real one
+    # (see :func:`make_basis_array`), so they contribute nothing to any
+    # integral. They are not basis parameters either -- a derivative with
+    # respect to a padded coefficient would otherwise be a perfectly finite,
+    # and perfectly meaningless, cross integral. Freeze them, leaving the
+    # values untouched.
+    data = np.where(basis.mask_data, basis.data,
+                    ops.stop_gradient(basis.data))
     ls = basis.ls
     for z in range(data.shape[0]):
         basis_add = data[z]
@@ -122,29 +158,31 @@ def make_bas_env(
             es = param[:,0]
             cs = param[:,1:]
             nprim, nctr = cs.shape
-
             cs = np.einsum("pi,p->pi", cs, gto_norm(l, es))
             if NORMALIZE_GTO:
                 cs = _nomalize_contracted_ao(l, es, cs)
 
-            _env.append(es)
-            _env.append(cs.T.ravel())
-            ptr_exp = ptr
-            ptr_coeff = ptr_exp + nprim
-            ptr = ptr_coeff + nprim * nctr
-            _bas.append([0, l, nprim, nctr, kappa, ptr_exp, ptr_coeff, 0])
+            exp.append(es)
+            ctr_coeff.append(cs.T.ravel())
+            bas.append([0, l, nprim, nctr, kappa, ptr_exp0, ptr_coeff0, 0])
+            ptr_exp0 += nprim
+            ptr_coeff0 += nprim * nctr
 
-    _bas = np.asarray(_bas, dtype=np.int32).reshape(data.shape[0], len(ls), BAS_SLOTS)
-    _env = np.hstack(_env)
-    return _bas, _env
+    bas = np.asarray(bas, dtype=np.int32).reshape(data.shape[0], len(ls), BAS_SLOTS)
+    bas = ops.index_add(bas, ops.index[..., PTR_COEFF], ptr_exp0)
+
+    exp = np.hstack(exp)
+    ctr_coeff = np.hstack(ctr_coeff)
+    env = np.hstack([exp, ctr_coeff])
+    return bas, env, exp, ctr_coeff
 
 def make_loc(
     basis: BasisArray,
     natm: int,
     key: str,
 ) -> numpy.ndarray:
-    l = numpy.repeat(basis.ls.reshape(1,-1), natm, axis=0).ravel()
-    nc = basis.data.shape[-1] - 1
+    l = numpy.tile(basis.ls, natm)
+    nc = basis.nctr
     if "cart" in key:
         dims = (l+1)*(l+2)//2 * nc
     elif "sph" in key:
@@ -185,7 +223,7 @@ def make_ao_mask(
     cart: bool = False,
 ) -> Array:
     ls = basis.ls
-    mask_shl_ctr = np.einsum("zs,zc->zsc", mask_shl, mask_ctr)
+    mask_shl_ctr = mask_shl[:,:,None] & mask_ctr
 
     def _scatter_sph(mask):
         out = [np.repeat(mask[i], l * 2 + 1) for i, l in enumerate(ls)]
@@ -247,11 +285,9 @@ def make_basis_array(
                          numpy.cumsum(numpy.bincount(ls), dtype=numpy.int32))
 
     a = numpy.zeros([max_number+1, len(ls), max_nexp, max_nc1], dtype=np.floatx)
-    # preset exponents to a large number
-    # for FP32 l can be up to 4
-    a[:,:,:,0] = 1e12 if np.floatx==np.float64 else 1e6
+    a[:,:,:,0] = 1.0
     mask_shl = numpy.zeros([max_number+1, len(ls)], dtype=bool)
-    mask_ctr = numpy.zeros([max_number+1, max_nc1-1], dtype=bool)
+    mask_ctr = numpy.zeros([max_number+1, len(ls), max_nc1-1], dtype=bool)
     mask_data = numpy.zeros_like(a, dtype=bool)
     for z in range(max_number+1):
         if z == 0: # dummy atom
@@ -264,14 +300,32 @@ def make_basis_array(
                 nexp, nc1 = b.shape
                 a[z, l_idx, :nexp, :nc1] = b.astype(np.floatx)
                 mask_shl[z, l_idx] = True
-                mask_ctr[z, :nc1-1] = True
+                mask_ctr[z, l_idx, :nc1-1] = True
                 mask_data[z, l_idx, :nexp, :nc1] = True
+
+    # A padded primitive slot carries a zero contraction coefficient, so it
+    # enters no integral, but its exponent still matters. libcint bounds the
+    # prefactor of a whole shell pair from the *last* stored exponent of each
+    # shell (``CINTset_pairdata``), taking the exponents to be in descending
+    # order so that the last one is the most diffuse and the bound is an upper
+    # one. A placeholder above the real exponents makes that bound too small
+    # and screens the shell pair's *real* primitive pairs away along with the
+    # padded ones. Repeating the shell's most diffuse exponent keeps the stored
+    # sequence non-increasing and the bound exact. Shells with no real
+    # primitive at all keep the 1.0 preset above.
+    es = a[:,:,:,0]
+    real = mask_data[:,:,:,0]
+    e_min = numpy.min(numpy.where(real, es, numpy.inf), axis=-1)
+    e_min = numpy.where(numpy.isfinite(e_min), e_min, 1.)
+    a[:,:,:,0] = numpy.where(real, es, e_min[:,:,None])
 
     return BasisArray(data=np.asarray(a, dtype=np.floatx),
                       mask_shl=np.asarray(mask_shl),
                       mask_ctr=np.asarray(mask_ctr),
                       mask_data=np.asarray(mask_data),
-                      ls=ls, l_loc=l_loc, nctr=numpy.int32(max_nc1-1))
+                      ls=ls, l_loc=l_loc,
+                      nprim=numpy.int32(max_nexp),
+                      nctr=numpy.int32(max_nc1-1))
 
 
 #if __name__ == "__main__":

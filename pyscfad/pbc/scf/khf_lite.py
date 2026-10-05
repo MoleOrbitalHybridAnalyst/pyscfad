@@ -56,7 +56,8 @@ def get_occ(
         mo_occ_kpts = mo_occ[inverse_idx].reshape(nkpts,-1)
     else:
         pick = (np.cumsum(mask) <= nocc) & mask
-        mo_occ = np.where(pick, 2., 0.)
+        mo_occ = np.zeros_like(pick, dtype=np.floatx)
+        mo_occ = np.where(pick, 2, mo_occ)
         mo_occ_kpts = mo_occ[inverse_idx].reshape(nkpts,-1)
 
         if mf.verbose >= logger.DEBUG:
@@ -86,7 +87,7 @@ class KSCF(SCFLite):
     ):
         if kpts is None:
             kpts = np.zeros((1,3))
-        self.kpts = np.asarray(kpts, dtype=float).reshape(-1,3)
+        self.kpts = np.asarray(kpts, dtype=np.floatx).reshape(-1,3)
 
         super().__init__(cell, **kwargs)
 
@@ -130,6 +131,46 @@ class KSCF(SCFLite):
             dm = self.make_rdm1(mo_coeff, mo_occ)
             fock = self.get_fock(dm=dm)
         return vmap(super().get_grad)(mo_coeff, mo_occ, fock)
+
+    def get_bands(
+        self,
+        kpts_band: ArrayLike,
+        cell: Cell | None = None,
+        dm_kpts: ArrayLike | None = None,
+        kpts: ArrayLike | None = None,
+    ) -> tuple[Array, Array]:
+        """Get energy bands at the given (arbitrary) 'band' k-points.
+
+        The Fock operator is rebuilt at ``kpts_band`` from the (converged)
+        density matrix on the SCF k-point mesh, then diagonalized.
+
+        Returns:
+            mo_energy: Band energies, ``(nkpts_band, nmo)``
+                (or ``(nmo,)`` for a single k-point input).
+            mo_coeff: Band orbitals, ``(nkpts_band, nao, nmo)``
+                (or ``(nao, nmo)`` for a single k-point input).
+        """
+        if cell is None:
+            cell = self.cell
+        if dm_kpts is None:
+            dm_kpts = self.make_rdm1()
+        if kpts is None:
+            kpts = self.kpts
+
+        kpts_band = np.asarray(kpts_band)
+        single_kpt_band = kpts_band.ndim == 1
+        kpts_band = kpts_band.reshape(-1, 3)
+
+        fock = self.get_hcore(cell, kpts=kpts_band)
+        vhf = self.get_veff(cell, dm_kpts, kpts=kpts, kpts_band=kpts_band)
+        fock = fock + getattr(vhf, "vxc", vhf)
+        s1e = self.get_ovlp(cell, kpts=kpts_band)
+        mo_energy, mo_coeff = self._eigh(fock, s1e)
+
+        if single_kpt_band:
+            mo_energy = mo_energy[0]
+            mo_coeff = mo_coeff[0]
+        return mo_energy, mo_coeff
 
     def energy_elec(
         self,

@@ -14,14 +14,16 @@
 """
 Anderson mixing
 """
-from typing import NamedTuple, Any
+from __future__ import annotations
+from typing import TYPE_CHECKING, NamedTuple, Any
 import operator
 import jax
 from jax import tree
 from pyscfad import numpy as np
 from pyscfad import pytree
 
-Array = Any
+if TYPE_CHECKING:
+    from pyscfad.typing import Array
 
 if np.floatx == np.float32:
     RIDGE_TOL = 1e-6
@@ -36,6 +38,9 @@ def _tree_axpy(a, xs, ys):
 
 def _tree_sub(xs, ys):
     return tree.map(operator.sub, xs, ys)
+
+def _tree_mix(a, xs, ys):
+    return tree.map(lambda x, y: a * x + (1.-a) * y, xs, ys)
 
 def _tree_set(xs, idx, vals):
     return tree.map(lambda x, val: x.at[idx].set(val), xs, vals)
@@ -81,7 +86,9 @@ def update_history(
 ) -> tuple[Any, Any, Array]:
     param_hist = _tree_set(param_hist, pos, param)
     res_hist = _tree_set(res_hist, pos, residual)
-    new_row = jax.vmap(_tree_vdot, in_axes=(0, None))(res_hist, residual)
+    # the mixing coefficients are real, so only the real part of the
+    # Gram matrix is needed (complex residuals arise with k-points)
+    new_row = jax.vmap(_tree_vdot, in_axes=(0, None))(res_hist, residual).real
     res_gram = res_gram.at[pos,:].set(new_row)
     res_gram = res_gram.at[:,pos].set(new_row)
     return param_hist, res_hist, res_gram
@@ -175,7 +182,8 @@ class Anderson(pytree.PytreeNode):
             return extrapolated
 
         def _use_param(param, state):
-            return param * (1.-self.damp) + param_last * self.damp
+            del state
+            return _tree_mix(1.-self.damp, param, param_last)
 
         start_cycle = jax.lax.select(
             np.greater_equal(self.start_cycle+1, self.space),
