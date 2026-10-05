@@ -27,7 +27,7 @@ from pyscfad.xtb.kxtb import GFN1KXTB
 from pyscfad.xtb.util import ke_cutoff_ewald
 from pyscfad.pbc.gto import CellLite as Cell
 from pyscfad.ml.gto import MolePad, make_basis_array
-from pyscfad.ml.xtb import make_param_array
+from pyscfad.ml.xtb import GFN1XTB as PadGFN1XTB, GFN1KXTB as PadGFN1KXTB, make_param_array
 from pyscfad.ml.xtb import alchem as alchem_pad
 from pyscfad.ml.pbc.gto import CellPad
 from pyscfad.ml.pbc.gto.cell_pad import make_image_grid
@@ -290,3 +290,147 @@ def test_alchem_proton_kxtb_pad(setup, pad_setup, cell_setup):
         assert abs(g_lam[b] - gl0) < 1e-8
         assert abs(g_coords[b][:len(n)] - gc0).max() < 1e-8
         assert numpy.all(numpy.asarray(g_coords[b][len(n):]) == 0)
+
+def _deprotonated(pnumbers, masks):
+    """Padded numbers with the alchemical atoms removed (atomic number 0)."""
+    return np.where(masks, 0, pnumbers)
+
+def test_alchem_proton_pad_endpoints(setup, pad_setup):
+    """Padded endpoints against plain padded GFN1: lam=0 equals the batch with the
+    protons removed (H2O, NH3) and lam=1 the protonated batch (H3O+, NH4+)."""
+    _, _, numbers, coords = setup
+    pbasis, pparam = pad_setup
+    systems = ((numbers, coords, 3), (NH4_NUMBERS, NH4_COORDS, 4))
+    pnumbers, pcoords, masks = _pad_batch(systems, 5)
+
+    for diis in (None, "qbroyden"):
+        def energy_ref(numbers, coords, charge):
+            mf = PadGFN1XTB(MolePad(numbers, coords, basis=pbasis, charge=charge), pparam)
+            mf.diis = diis
+            return mf.kernel()
+        def energy(numbers, coords, mask, lam):
+            mol = MolePad(numbers, coords, basis=pbasis, charge=1)
+            mf = alchem_pad.AlchemGFN1XTB(mol, pparam, lam=lam, alchem_mask=mask)
+            mf.diis = diis
+            return mf.kernel()
+        e_ref = jax.jit(jax.vmap(energy_ref, in_axes=(0, 0, None)), static_argnums=2)
+        e_alc = jax.jit(jax.vmap(energy, in_axes=(0, 0, 0, None)))
+        e0 = e_ref(_deprotonated(pnumbers, masks), pcoords, 0)
+        e1 = e_ref(pnumbers, pcoords, 1)
+        assert abs(e_alc(pnumbers, pcoords, masks, 0.) - e0).max() < 1e-8
+        assert abs(e_alc(pnumbers, pcoords, masks, 1.) - e1).max() < 1e-8
+
+def test_alchem_proton_pad_qmmm(setup, pad_setup, mm_setup):
+    """Padded alchemical QM/MM with dipolar and quadrupolar couplings: lam=0 equals
+    plain padded QM/MM of H2O, and lam=0.3 reproduces the unpadded class."""
+    basis, param, numbers, coords = setup
+    pbasis, pparam = pad_setup
+    a, mm_coords, mm_charges, mm_radii = mm_setup
+    pnumbers, pcoords, masks = _pad_batch(((numbers, coords, 3),), 5)
+    pnumbers, pcoords, mask = pnumbers[0], pcoords[0], masks[0]
+
+    @jax.jit
+    def ewald_params():
+        mol = Mole(numbers=numbers, coords=coords, basis=basis, charge=1, verbose=0)
+        mf = add_mm_charges(GFN1XTB(mol, param=param), mm_coords, a, mm_charges, mm_radii,
+                            unit="Bohr", mm_ew_rcut=5.0)
+        return mf.mm_ew_eta, mf.mm_ew_mesh, mf.qm_ew_mesh
+    mm_ew_eta, mm_ew_mesh, qm_ew_mesh = ewald_params()
+    ew_kwargs = {"mm_ew_rcut": 5.0, "mm_ew_eta": float(mm_ew_eta),
+                 "mm_ew_mesh": numpy.asarray(mm_ew_mesh), "qm_ew_mesh": numpy.asarray(qm_ew_mesh)}
+
+    def qmmm_fn(mf):
+        z = np.asarray(mf.mol.atom_charges())
+        mf.param.dipgam = np.where(z > 0, 0.6, 0.)
+        mf.param.quadgam = np.where(z > 0, 0.4, 0.)
+        return add_mm_charges(mf, mm_coords, a, mm_charges, mm_radii, unit="Bohr", **ew_kwargs)
+
+    @jax.jit
+    def e_ref():
+        mol = MolePad(_deprotonated(pnumbers, mask), pcoords, basis=pbasis, charge=0)
+        return qmmm_fn(PadGFN1XTB(mol, pparam)).kernel()
+
+    def energy_pad(coords, lam):
+        mol = MolePad(pnumbers, coords, basis=pbasis, charge=1)
+        mf = alchem_pad.AlchemGFN1XTB(mol, pparam, lam=lam, alchem_mask=mask, **EXP_PENALTY)
+        return qmmm_fn(mf).kernel()
+    energy_pad = jax.jit(jax.value_and_grad(energy_pad, argnums=(0, 1)))
+
+    def energy(coords, lam):
+        mol = Mole(numbers=numbers, coords=coords, basis=basis, charge=1, verbose=0)
+        mf = AlchemGFN1XTB(mol, param, lam=lam, alchem_atoms=(3,), **EXP_PENALTY)
+        return qmmm_fn(mf).kernel()
+    energy = jax.jit(jax.value_and_grad(energy, argnums=(0, 1)))
+
+    assert abs(energy_pad(pcoords, 0.)[0] - e_ref()) < 1e-8
+
+    # padded vs unpadded QM/MM differ by ~4e-9 even for plain GFN1
+    e1, (gc1, gl1) = energy_pad(pcoords, .3)
+    e0, (gc0, gl0) = energy(coords, .3)
+    assert abs(e1 - e0) < 1e-7
+    assert abs(gl1 - gl0) < 1e-7
+    assert abs(gc1[:4] - gc0).max() < 1e-7
+    assert numpy.all(numpy.asarray(gc1[4:]) == 0)
+
+def test_alchem_proton_kxtb_pad_endpoints(setup, pad_setup, cell_setup):
+    """Padded periodic endpoints against plain padded GFN1KXTB of the deprotonated
+    (neutral) and protonated cells."""
+    _, _, numbers, coords = setup
+    pbasis, pparam = pad_setup
+    a, rcut, nimgs, mesh, kpts = cell_setup
+    nk = len(kpts)
+    systems = ((numbers, coords, 3), (NH4_NUMBERS, NH4_COORDS, 4))
+    pnumbers, pcoords, masks = _pad_batch(systems, 5)
+    Ls = np.asarray(make_image_grid(numpy.asarray(nimgs)), dtype=np.float64) @ a
+
+    def make_cell(numbers, coords, charge):
+        return CellPad(numbers, coords, basis=pbasis, a=a, Ls=Ls, rcut=rcut,
+                       precision=1e-6, charge=charge)
+    def energy_ref(numbers, coords, charge):
+        return _kxtb_scf(PadGFN1KXTB(make_cell(numbers, coords, charge), pparam, kpts=kpts),
+                         mesh, "anderson")
+    def energy(numbers, coords, mask, lam):
+        mf = alchem_pad.AlchemGFN1KXTB(make_cell(numbers, coords, nk), pparam, lam=lam,
+                                       alchem_mask=mask, kpts=kpts)
+        return _kxtb_scf(mf, mesh, "anderson")
+    e_ref = jax.jit(jax.vmap(energy_ref, in_axes=(0, 0, None)), static_argnums=2)
+    e_alc = jax.jit(jax.vmap(energy, in_axes=(0, 0, 0, None)))
+    assert abs(e_alc(pnumbers, pcoords, masks, 0.)
+               - e_ref(_deprotonated(pnumbers, masks), pcoords, 0)).max() < 1e-8
+    assert abs(e_alc(pnumbers, pcoords, masks, 1.) - e_ref(pnumbers, pcoords, nk)).max() < 1e-8
+
+def test_alchem_proton_kxtb_small_cell(setup):
+    """6 Bohr cell along x, where the proton couples to periodic images of the other
+    atoms: lam=0 is exact only if those lattice pairs are scaled (leaving them
+    unscaled gives a 2e-4 Eh error). Also checks the lattice gradient."""
+    basis, param, numbers, coords = setup
+    a = numpy.diag([6., 9., 9.])
+    rcut, precision = 18., 1e-10   # converged lattice sums for a tight lam=0 comparison
+    cell0 = Cell(numbers=numbers, coords=coords, a=a, basis=basis, rcut=rcut, precision=precision)
+    cell_kw = {"basis": basis, "rcut": rcut, "precision": precision,
+               "nimgs": tuple(int(x) for x in cell0.nimgs)}
+    mesh = tuple(int(x) for x in cell0.cutoff_to_mesh(
+        ke_cutoff_ewald(GFN1KXTB.ewald_alpha, precision * cell0.vol)))
+    kpts = cell0.make_kpts([2, 1, 1])
+    nk = len(kpts)
+
+    @jax.jit
+    def e_h2o():
+        cell = Cell(numbers=numbers[:3], coords=coords[:3], a=a, charge=0, **cell_kw)
+        return _kxtb_scf(GFN1KXTB(cell, param=param, kpts=kpts), mesh, "anderson")
+
+    def energy(lam, a):
+        cell = Cell(numbers=numbers, coords=coords, a=a, charge=nk, **cell_kw)
+        mf = AlchemGFN1KXTB(cell, param, lam=lam, alchem_atoms=(3,), kpts=kpts)
+        return _kxtb_scf(mf, mesh, "anderson")
+    energy, grad = jax.jit(energy), jax.jit(jax.grad(energy, argnums=1))
+    assert abs(energy(0., a) - e_h2o()) < 1e-9
+
+    g = grad(.4, a)
+    h = 1e-4
+    for i, j in ((0, 0), (1, 2)):
+        ap, am = a.copy(), a.copy()
+        ap[i, j] += h
+        am[i, j] -= h
+        fd = (energy(.4, ap) - energy(.4, am)) / (2 * h)
+        assert abs(g[i, j] - fd) < 1e-6
