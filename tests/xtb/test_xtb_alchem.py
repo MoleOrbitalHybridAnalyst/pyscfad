@@ -23,6 +23,15 @@ from pyscfad.xtb import GFN1XTB
 from pyscfad.xtb.param import GFN1Param
 from pyscfad.xtb.alchem import AlchemGFN1XTB
 from pyscfad.xtb.qmmm_pbc.itrf import add_mm_charges
+from pyscfad.ml.gto import MolePad, make_basis_array
+from pyscfad.ml.xtb import make_param_array
+from pyscfad.ml.xtb import alchem as alchem_pad
+
+# NH4+ (Bohr); the last H is the alchemical proton
+NH4_NUMBERS = numpy.array([7, 1, 1, 1, 1])
+NH4_COORDS = numpy.array([[0., 0., 0.], [1.9, 0., 0.], [-0.63, 1.79, 0.],
+                          [-0.63, -0.9, 1.55], [-0.7, -0.85, -1.6]])
+EXP_PENALTY = {"penalty": 2.5, "switch": {"penalty": lambda x: np.exp(-20 * x)}}
 
 @pytest.fixture
 def setup():
@@ -146,3 +155,53 @@ def test_alchem_proton_qmmm_multipoles(setup, mm_setup):
     assert abs(energy(coords, 0.) - e_h2o) < 1e-6
 
     _check_grads(energy, grad, coords)
+
+@pytest.fixture
+def pad_setup():
+    bfile = xtb_basis.get_basis_filename()
+    basis = make_basis_array(bfile, max_number=8)
+    param = make_param_array(basis, max_number=8)
+    yield basis, param
+
+def _pad_batch(systems, natm):
+    """Pad (numbers, coords, alchemical atom) triples to ``natm`` atoms."""
+    numbers, coords, masks = [], [], []
+    for n, c, ia in systems:
+        npad = natm - len(n)
+        numbers.append(numpy.hstack([n, numpy.zeros(npad, dtype=int)]))
+        coords.append(numpy.vstack([c, numpy.zeros((npad, 3))]))
+        mask = numpy.zeros(natm, dtype=bool)
+        mask[ia] = True
+        masks.append(mask)
+    return np.asarray(numpy.array(numbers)), np.asarray(numpy.array(coords)), np.asarray(numpy.array(masks))
+
+def test_alchem_proton_pad(setup, pad_setup):
+    """Batched padded molecules (H3O+, NH4+) with their own proton and lam
+    reproduce the unpadded alchemical energies and gradients."""
+    basis, param, numbers, coords = setup
+    pbasis, pparam = pad_setup
+    systems = ((numbers, coords, 3), (NH4_NUMBERS, NH4_COORDS, 4))
+    pnumbers, pcoords, masks = _pad_batch(systems, 5)
+    lams = np.array([0.3, 0.8])
+
+    for diis in (None, "qbroyden"):
+        def energy_pad(numbers, coords, mask, lam):
+            mol = MolePad(numbers, coords, basis=pbasis, charge=1)
+            mf = alchem_pad.AlchemGFN1XTB(mol, pparam, lam=lam, alchem_mask=mask, **EXP_PENALTY)
+            mf.diis = diis
+            return mf.kernel()
+        e, (g_coords, g_lam) = jax.jit(jax.vmap(
+            jax.value_and_grad(energy_pad, argnums=(1, 3))))(pnumbers, pcoords, masks, lams)
+
+        for b, (n, c, ia) in enumerate(systems):
+            def energy(c, lam):
+                mol = Mole(numbers=n, coords=c, basis=basis, charge=1, verbose=0)
+                mf = AlchemGFN1XTB(mol, param, lam=lam, alchem_atoms=(ia,), **EXP_PENALTY)
+                mf.diis = diis
+                return mf.kernel()
+            e0, (gc0, gl0) = jax.jit(jax.value_and_grad(energy, argnums=(0, 1)))(c, lams[b])
+            assert abs(e[b] - e0) < 1e-10
+            assert abs(g_lam[b] - gl0) < 1e-8
+            assert abs(g_coords[b][:len(n)] - gc0).max() < 1e-8
+            assert numpy.all(numpy.asarray(g_coords[b][len(n):]) == 0)
+

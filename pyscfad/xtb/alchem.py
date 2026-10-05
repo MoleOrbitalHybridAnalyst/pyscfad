@@ -37,7 +37,9 @@ At ``lam=0`` the alchemical AOs are exactly decoupled and empty (for a large eno
 The switches are implemented once in :class:`AlchemMixin` and combined with the
 XTB classes:
 
-* :class:`AlchemGFN1XTB`: molecules.
+* :class:`AlchemGFN1XTB`: molecules;
+* :class:`pyscfad.ml.xtb.alchem.AlchemGFN1XTB`: padded (batched) molecules, with the
+  alchemical atoms given as a (traceable) per-atom mask.
 
 .. warning::
     Preliminary implementation. The defaults (linear switches, ``penalty=1``) are kept
