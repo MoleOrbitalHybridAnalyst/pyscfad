@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 import pytest
 import jax
 from pyscf.data.nist import BOHR
@@ -22,6 +23,7 @@ from pyscfad.xtb import GFN1XTB
 from pyscfad.xtb.param import GFN1Param
 from pyscfad.pbc.gto import CellLite as Cell
 from pyscfad.xtb.kxtb import GFN1KXTB
+from pyscfad.xtb.util import ke_cutoff_ewald
 
 @pytest.fixture
 def setup():
@@ -263,3 +265,35 @@ def test_gfn1_kxtb_smearing(setup):
     e1, g1 = jax.value_and_grad(cell_energy)(coords)
     assert abs(e1 - e0) < 1e-6
     assert abs(g1 - g0).max() < 1e-6
+
+def test_gfn1_kxtb_charged_kpts_qbroyden(setup):
+    """Charged cell with several k-points: the charge-Broyden solver normalizes the
+    per-cell shell charges to cell.charge / nkpts and agrees with Anderson mixing."""
+    basis, param = setup
+    numbers = [8, 1, 1, 1]
+    coords = np.array([[0., 0., 0.], [1.43355, 0., -0.95296],
+                       [1.43355, 0., 0.95296], [-0.8, 0.1, 1.6]])
+    a = np.eye(3) * 9.
+    cell0 = Cell(numbers=numbers, coords=coords, a=a, basis=basis, rcut=12., precision=1e-6)
+    nimgs = tuple(int(x) for x in cell0.nimgs)
+    kpts = cell0.make_kpts([2, 1, 1])
+    # static Ewald mesh, so that the SCF can be jitted
+    mesh = tuple(int(x) for x in cell0.cutoff_to_mesh(
+        ke_cutoff_ewald(GFN1KXTB.ewald_alpha, cell0.precision * cell0.vol)))
+
+    @partial(jax.jit, static_argnums=0)
+    def energy(diis):
+        # H3O+ in each cell; cell.charge is that of the k-point supercell
+        cell = Cell(numbers=numbers, coords=coords, a=a, basis=basis, rcut=12.,
+                    nimgs=nimgs, precision=1e-6, charge=len(kpts))
+        mf = GFN1KXTB(cell, param=param, kpts=kpts)
+        mf.ewald_mesh = mesh
+        mf.diis = diis
+        mf.conv_tol = 1e-10
+        e = mf.kernel()
+        return e, mf.converged
+
+    e0, _ = energy("anderson")
+    e1, conv = energy("qbroyden")
+    assert conv
+    assert abs(e1 - e0) < 1e-8

@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING
 
 from pyscfad import numpy as np
 from pyscfad import ops
-from pyscfad.lib import hermi_triu
 from pyscfad.gto.mole import inter_distance
 
 from pyscfad.xtb import xtb, kxtb, util
@@ -144,16 +143,15 @@ class GFN1KXTB(kxtb.GFN1KXTB, KXTB):
         dm_kpts = dm_kpts * scale
         return dm_kpts.astype(np.complexx)
 
-    def get_hcore(
+    def _get_EHT_factor_lat(
         self,
         cell: CellPad | None = None,
-        s1e: ArrayLike | None = None,
-        kpts: ArrayLike | None = None,
+        Ls: ArrayLike | None = None,
     ) -> Array:
         if cell is None:
             cell = self.cell
-        if kpts is None:
-            kpts = self.kpts
+        if Ls is None:
+            Ls = cell.Ls
 
         param = self.param
 
@@ -167,7 +165,6 @@ class GFN1KXTB(kxtb.GFN1KXTB, KXTB):
         hdiag = xtb.EHT_Hdiag_GFN1(cell, param)
         pair_mask = util.mask_atom_pairs(cell)[util.atom_to_bas_indices_2d(cell)]
 
-        Ls = cell.Ls
         nL = len(Ls)
         h1 = np.where(
             np.repeat(pair_mask[None, :, :], nL, axis=0),
@@ -180,17 +177,5 @@ class GFN1KXTB(kxtb.GFN1KXTB, KXTB):
         h1 = np.where(shl_pair_mask[None, ...], h1, 0.0)
         h1 = np.asarray(h1, dtype=np.floatx)
 
-        if cell is self.cell:
-            s1e_lat = self.s1e_lat
-        else:
-            s1e_lat = self.get_ovlp_lat(cell=cell, Ls=Ls)
-
-        expkL = np.exp(1j * np.dot(kpts, Ls.T)).astype(np.complexx)
         i, j = util.bas_to_ao_indices_2d(cell)
-        hcore = np.einsum("kl,lpq->kpq", expkL, s1e_lat * h1[:, i, j])
-
-        if cell.cuint_plan is None:
-            hcore = hermi_triu(hcore)
-        else:
-            hcore = hcore + hcore.transpose(0, 2, 1).conj()
-        return hcore
+        return h1[:, i, j]

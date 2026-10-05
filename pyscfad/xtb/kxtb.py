@@ -199,6 +199,14 @@ class KXTB(xtb.XTB, KSCFLite):
     def tot_electrons(self) -> Array:
         return xtb.tot_valence_electrons(self.cell, nkpts=len(self.kpts))
 
+    @property
+    def tot_charge(self) -> float:
+        """Target sum of the shell charges of one cell.
+
+        ``cell.charge`` is the charge of the k-point supercell (see :attr:`tot_electrons`).
+        """
+        return self.cell.charge / len(self.kpts)
+
     def get_ovlp(
         self,
         cell: Cell | None = None,
@@ -339,6 +347,34 @@ class GFN1KXTB(KXTB, xtb.GFN1XTB):
         if kpts is None:
             kpts = self.kpts
 
+        Ls = cell.Ls
+        if cell is self.cell:
+            s1e_lat = self.s1e_lat
+        else:
+            s1e_lat = self.get_ovlp_lat(cell=cell, Ls=Ls)
+
+        expkL = np.exp(1j*np.dot(kpts, Ls.T)).astype(np.complexx)
+        hcore = np.einsum("kl,lpq->kpq", expkL,
+                          s1e_lat * self._get_EHT_factor_lat(cell, Ls=Ls))
+
+        if cell.cuint_plan is None:
+            hcore = hermi_triu(hcore)
+        else:
+            hcore = hcore + hcore.transpose(0,2,1).conj()
+        return hcore
+
+    def _get_EHT_factor_lat(
+        self,
+        cell: Cell | None = None,
+        Ls: ArrayLike | None = None,
+    ) -> Array:
+        """Extended-Hueckel factors of the AO pairs between the home cell and image ``L``,
+        shape ``(nL, nao, nao)``; the lattice core Hamiltonian is ``s1e_lat`` times this."""
+        if cell is None:
+            cell = self.cell
+        if Ls is None:
+            Ls = cell.Ls
+
         param = self.param
 
         mask = util.mask_valence_shell_gfn1(cell)
@@ -349,27 +385,14 @@ class GFN1KXTB(KXTB, xtb.GFN1XTB):
         hdiag = xtb.EHT_Hdiag_GFN1(cell, param)
         mask = util.mask_atom_pairs(cell)[util.atom_to_bas_indices_2d(cell)]
 
-        Ls = cell.Ls
         nL = len(Ls)
         h1 = np.where(np.repeat(mask[None,:,:], nL, axis=0),
                       hscale[None,:,:] * EHT_PI_GFN1(cell, param, Ls=Ls) * hdiag[None,:,:],
                       np.repeat(hdiag[None,:,:], nL, axis=0))
         h1 = np.asarray(h1, dtype=np.floatx)
 
-        if cell is self.cell:
-            s1e_lat = self.s1e_lat
-        else:
-            s1e_lat = self.get_ovlp_lat(cell=cell, Ls=Ls)
-
-        expkL = np.exp(1j*np.dot(kpts, Ls.T)).astype(np.complexx)
         i, j = util.bas_to_ao_indices_2d(cell)
-        hcore = np.einsum("kl,lpq->kpq", expkL, s1e_lat * h1[:,i,j])
-
-        if cell.cuint_plan is None:
-            hcore = hermi_triu(hcore)
-        else:
-            hcore = hcore + hcore.transpose(0,2,1).conj()
-        return hcore
+        return h1[:,i,j]
 
     def get_veff(
         self,
@@ -400,11 +423,10 @@ class GFN1KXTB(KXTB, xtb.GFN1XTB):
         phi = np.dot(self.gamma, mono)
         ecoul = .5 * np.dot(mono, phi)
 
-        if cell.charge != 0:
-            Q = cell.charge / len(kpts)
-            #Q = np.sum(mono)
-            ecoul += -.5 * np.pi/(self.ewald_alpha**2 * cell.vol) * Q**2
-            #phi += -np.pi/(self.ewald_alpha**2 * cell.vol) * Q
+        # neutralizing background of the net cell charge (zero for neutral cells);
+        # tot_charge rather than cell.charge, as it can be fractional (alchemical atoms)
+        Q = self.tot_charge
+        ecoul += -.5 * np.pi/(self.ewald_alpha**2 * cell.vol) * Q**2
 
         # Third-order term
         atm_charge = xtb.sum_shell_charges(cell, mono)
