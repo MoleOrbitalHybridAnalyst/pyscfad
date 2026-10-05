@@ -21,11 +21,16 @@ from pyscfad.gto import MoleLite as Mole
 from pyscfad.xtb import basis as xtb_basis
 from pyscfad.xtb import GFN1XTB
 from pyscfad.xtb.param import GFN1Param
-from pyscfad.xtb.alchem import AlchemGFN1XTB
+from pyscfad.xtb.alchem import AlchemGFN1XTB, AlchemGFN1KXTB
 from pyscfad.xtb.qmmm_pbc.itrf import add_mm_charges
+from pyscfad.xtb.kxtb import GFN1KXTB
+from pyscfad.xtb.util import ke_cutoff_ewald
+from pyscfad.pbc.gto import CellLite as Cell
 from pyscfad.ml.gto import MolePad, make_basis_array
 from pyscfad.ml.xtb import make_param_array
 from pyscfad.ml.xtb import alchem as alchem_pad
+from pyscfad.ml.pbc.gto import CellPad
+from pyscfad.ml.pbc.gto.cell_pad import make_image_grid
 
 # NH4+ (Bohr); the last H is the alchemical proton
 NH4_NUMBERS = numpy.array([7, 1, 1, 1, 1])
@@ -205,3 +210,83 @@ def test_alchem_proton_pad(setup, pad_setup):
             assert abs(g_coords[b][:len(n)] - gc0).max() < 1e-8
             assert numpy.all(numpy.asarray(g_coords[b][len(n):]) == 0)
 
+@pytest.fixture
+def cell_setup(setup):
+    """Small cubic cell for H3O+/NH4+ with shared static lattice-sum settings."""
+    basis, *_ = setup
+    a = numpy.eye(3) * 9.
+    rcut = 12.
+    cells = [Cell(numbers=n, coords=c, a=a, basis=basis, rcut=rcut, precision=1e-6)
+             for n, c in ((numpy.array([8, 1, 1, 1]), numpy.zeros((4, 3))),
+                          (NH4_NUMBERS, NH4_COORDS))]
+    nimgs = tuple(int(x) for x in numpy.max([numpy.asarray(c.nimgs) for c in cells], axis=0))
+    mesh = tuple(int(x) for x in numpy.max(
+        [numpy.asarray(c.cutoff_to_mesh(ke_cutoff_ewald(GFN1KXTB.ewald_alpha, 1e-6 * float(c.vol))))
+         for c in cells], axis=0))
+    kpts = cells[0].make_kpts([2, 1, 1])
+    yield a, rcut, nimgs, mesh, kpts
+
+def _kxtb_scf(mf, mesh, diis):
+    mf.ewald_mesh = mesh
+    mf.diis = diis
+    mf.conv_tol = 1e-11
+    return mf.kernel()
+
+def test_alchem_proton_kxtb(setup, cell_setup):
+    """Periodic H3O+ (2 k-points; charged at lam=1, neutral at lam=0): endpoints
+    equal GFN1KXTB of H3O+ and H2O, and the gradients match finite differences."""
+    basis, param, numbers, coords = setup
+    a, rcut, nimgs, mesh, kpts = cell_setup
+    nk = len(kpts)
+    cell_kw = {"a": a, "basis": basis, "rcut": rcut, "nimgs": nimgs, "precision": 1e-6}
+
+    for diis in ("anderson", "qbroyden"):
+        @jax.jit
+        def e_ref():
+            cells = (Cell(numbers=numbers, coords=coords, charge=nk, **cell_kw),
+                     Cell(numbers=numbers[:3], coords=coords[:3], charge=0, **cell_kw))
+            return [_kxtb_scf(GFN1KXTB(c, param=param, kpts=kpts), mesh, diis) for c in cells]
+        e_h3o, e_h2o = e_ref()
+
+        def energy(coords, lam):
+            # cell.charge is that of the k-point supercell (nk cells)
+            cell = Cell(numbers=numbers, coords=coords, charge=nk, **cell_kw)
+            mf = AlchemGFN1KXTB(cell, param, lam=lam, alchem_atoms=(3,), kpts=kpts)
+            return _kxtb_scf(mf, mesh, diis)
+        energy, grad = jax.jit(energy), jax.jit(jax.grad(energy, argnums=(0, 1)))
+        assert abs(energy(coords, 0.) - e_h2o) < 1e-8
+        assert abs(energy(coords, 1.) - e_h3o) < 1e-8
+        _check_grads(energy, grad, coords)
+
+def test_alchem_proton_kxtb_pad(setup, pad_setup, cell_setup):
+    """Batched padded cells (H3O+, NH4+) reproduce the unpadded periodic alchemy."""
+    basis, param, numbers, coords = setup
+    pbasis, pparam = pad_setup
+    a, rcut, nimgs, mesh, kpts = cell_setup
+    nk = len(kpts)
+    systems = ((numbers, coords, 3), (NH4_NUMBERS, NH4_COORDS, 4))
+    pnumbers, pcoords, masks = _pad_batch(systems, 5)
+    lams = np.array([0.3, 0.8])
+    Ls = np.asarray(make_image_grid(numpy.asarray(nimgs)), dtype=np.float64) @ a
+
+    def energy_pad(numbers, coords, mask, lam):
+        cell = CellPad(numbers, coords, basis=pbasis, a=a, Ls=Ls, rcut=rcut,
+                       precision=1e-6, charge=nk)
+        mf = alchem_pad.AlchemGFN1KXTB(cell, pparam, lam=lam, alchem_mask=mask, kpts=kpts,
+                                       **EXP_PENALTY)
+        return _kxtb_scf(mf, mesh, "anderson")
+    e, (g_coords, g_lam) = jax.jit(jax.vmap(
+        jax.value_and_grad(energy_pad, argnums=(1, 3))))(pnumbers, pcoords, masks, lams)
+
+    for b, (n, c, ia) in enumerate(systems):
+        def energy(c, lam):
+            cell = Cell(numbers=n, coords=c, a=a, basis=basis, rcut=rcut, nimgs=nimgs,
+                        precision=1e-6, charge=nk)
+            mf = AlchemGFN1KXTB(cell, param, lam=lam, alchem_atoms=(ia,), kpts=kpts,
+                                **EXP_PENALTY)
+            return _kxtb_scf(mf, mesh, "anderson")
+        e0, (gc0, gl0) = jax.jit(jax.value_and_grad(energy, argnums=(0, 1)))(c, lams[b])
+        assert abs(e[b] - e0) < 1e-10
+        assert abs(g_lam[b] - gl0) < 1e-8
+        assert abs(g_coords[b][:len(n)] - gc0).max() < 1e-8
+        assert numpy.all(numpy.asarray(g_coords[b][len(n):]) == 0)

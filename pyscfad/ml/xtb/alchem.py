@@ -20,13 +20,15 @@ See :mod:`pyscfad.xtb.alchem` for the alchemical model.
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from pyscfad.xtb.alchem import AlchemMixin
+from pyscfad.xtb.alchem import AlchemMixin, AlchemKXTBMixin
 from pyscfad.ml.xtb.xtb_pad import GFN1XTB
+from pyscfad.ml.xtb.kxtb_pad import GFN1KXTB
 
 if TYPE_CHECKING:
     from typing import Callable
     from pyscfad.typing import ArrayLike
     from pyscfad.ml.gto import MolePad
+    from pyscfad.ml.pbc.gto import CellPad
     from pyscfad.ml.xtb.param import GFN1ParamArray
 
 
@@ -53,3 +55,25 @@ class AlchemGFN1XTB(AlchemMixin, GFN1XTB):
                                        alchem_mask=alchem_mask, penalty=penalty, switch=switch)
         super().__init__(mol, param=mol_param, **kwargs)
 
+
+class AlchemGFN1KXTB(AlchemKXTBMixin, GFN1KXTB):
+    """Padded GFN1-XTB with k-point sampling and alchemical bare protons.
+
+    The cell is built with the charge of the ``lam=1`` state; the alchemical atoms
+    are given by ``alchem_mask`` as in :class:`AlchemGFN1XTB`.
+    """
+    def __init__(
+        self,
+        cell: CellPad,
+        param: GFN1ParamArray,
+        lam: ArrayLike = 1.,
+        alchem_mask: ArrayLike | None = None,
+        penalty: float = 1.,
+        switch: dict[str, Callable] | None = None,
+        alchem_atoms: tuple[int, ...] | None = None,
+        kpts: ArrayLike | None = None,
+        **kwargs,
+    ):
+        mol_param = self._alchem_setup(cell, param, lam=lam, alchem_atoms=alchem_atoms,
+                                       alchem_mask=alchem_mask, penalty=penalty, switch=switch)
+        super().__init__(cell, param=mol_param, kpts=kpts, **kwargs)

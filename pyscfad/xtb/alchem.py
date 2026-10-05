@@ -34,12 +34,15 @@ The following quantities are switched by ``lam``:
 At ``lam=0`` the alchemical AOs are exactly decoupled and empty (for a large enough
 ``penalty``), so the energy equals that of the system without the alchemical atoms.
 
-The switches are implemented once in :class:`AlchemMixin` and combined with the
-XTB classes:
+The switches are implemented once in :class:`AlchemMixin` (and
+:class:`AlchemKXTBMixin` for k-point sampling, where they act on the lattice sums)
+and combined with the XTB classes:
 
 * :class:`AlchemGFN1XTB`: molecules;
-* :class:`pyscfad.ml.xtb.alchem.AlchemGFN1XTB`: padded (batched) molecules, with the
-  alchemical atoms given as a (traceable) per-atom mask.
+* :class:`AlchemGFN1KXTB`: periodic systems with k-point sampling;
+* :class:`pyscfad.ml.xtb.alchem.AlchemGFN1XTB` and
+  :class:`pyscfad.ml.xtb.alchem.AlchemGFN1KXTB`: padded (batched) molecules and cells,
+  with the alchemical atoms given as a (traceable) per-atom mask.
 
 .. warning::
     Preliminary implementation. The defaults (linear switches, ``penalty=1``) are kept
@@ -56,6 +59,7 @@ import numpy
 from pyscfad import numpy as np
 from pyscfad.xtb import util
 from pyscfad.xtb.xtb import GFN1XTB
+from pyscfad.xtb.kxtb import KXTB, GFN1KXTB
 from pyscfad.xtb.param import cn_d3
 from pyscfad.xtb.data.elements import N_VALENCE_ARRAY
 
@@ -63,6 +67,7 @@ if TYPE_CHECKING:
     from typing import Any, Callable
     from pyscfad.typing import ArrayLike, Array
     from pyscfad.gto import MoleLite
+    from pyscfad.pbc.gto import CellLite as Cell
 
 SWITCH_KEYS = ("ovlp", "onsite", "penalty", "charge", "rep", "cn")
 
@@ -156,6 +161,8 @@ class AlchemMixin:
 
         # AO-pair factors for overlap-like quantities
         w_ao = np.where(alch_ao, s["ovlp"], 1.)
+        self._w_ao = w_ao
+        self._same_atom_ao = same_atom
         self._ovlp_fac = np.where(same_atom, 1., w_ao[:,None] * w_ao[None,:])
         # on-site blocks of alchemical atoms
         self._onsite_mask = same_atom & alch_ao[:,None]
@@ -226,3 +233,68 @@ class AlchemGFN1XTB(AlchemMixin, GFN1XTB):
                                        alchem_mask=alchem_mask, penalty=penalty, switch=switch)
         super().__init__(mol, param=mol_param, **kwargs)
 
+
+def _home_cell_mask(Ls: ArrayLike) -> Array:
+    """``(nL,)`` mask of the zero lattice vector."""
+    return np.all(np.asarray(Ls).reshape(-1, 3) == 0, axis=1)
+
+class AlchemKXTBMixin(AlchemMixin):
+    """Alchemical bare atoms for XTB methods with k-point sampling.
+
+    The overlap and core Hamiltonian are built from lattice sums over images ``L``,
+    so the switches act there: AO pairs between an alchemical atom and any other
+    site (including the periodic images of the alchemical atom itself) are scaled
+    like the molecular overlap, and the penalty enters only the on-site blocks of
+    the home cell (``L = 0``). The net cell charge, including the Ewald background
+    term, follows :attr:`tot_charge`.
+    """
+    # the k-space overlap is assembled from the (masked) lattice overlap
+    get_ovlp = KXTB.get_ovlp
+
+    def _lattice_pair_fac(self, Ls: ArrayLike) -> Array:
+        home = _home_cell_mask(Ls)[:,None,None] & self._same_atom_ao[None]
+        return np.where(home, 1., (self._w_ao[:,None] * self._w_ao[None,:])[None])
+
+    def get_ovlp_lat(self, cell: Cell | None = None, Ls: ArrayLike | None = None) -> Array:
+        if cell is None:
+            cell = self.cell
+        if Ls is None:
+            Ls = cell.Ls
+        return super().get_ovlp_lat(cell=cell, Ls=Ls) * self._lattice_pair_fac(Ls)
+
+    def _get_EHT_factor_lat(self, cell: Cell | None = None, Ls: ArrayLike | None = None) -> Array:
+        if cell is None:
+            cell = self.cell
+        if Ls is None:
+            Ls = cell.Ls
+        h1 = super()._get_EHT_factor_lat(cell, Ls=Ls)
+        onsite = _home_cell_mask(Ls)[:,None,None] & self._onsite_mask[None]
+        g = self._switch_values["onsite"]
+        p = self._switch_values["penalty"]
+        return np.where(onsite, g * h1 + p * self.penalty, h1)
+
+    def dip_moment(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class AlchemGFN1KXTB(AlchemKXTBMixin, GFN1KXTB):
+    """GFN1-XTB with k-point sampling and alchemical bare protons.
+
+    The cell is built with the charge of the ``lam=1`` state.
+    See :class:`AlchemMixin` for the other arguments.
+    """
+    def __init__(
+        self,
+        cell: Cell,
+        param: Any,
+        lam: ArrayLike = 1.,
+        alchem_atoms: tuple[int, ...] | None = None,
+        penalty: float = 1.,
+        switch: dict[str, Callable] | None = None,
+        alchem_mask: ArrayLike | None = None,
+        kpts: ArrayLike | None = None,
+        **kwargs,
+    ):
+        mol_param = self._alchem_setup(cell, param, lam=lam, alchem_atoms=alchem_atoms,
+                                       alchem_mask=alchem_mask, penalty=penalty, switch=switch)
+        super().__init__(cell, param=mol_param, kpts=kpts, **kwargs)
