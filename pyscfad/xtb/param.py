@@ -202,7 +202,7 @@ class GFN1MolParam(pytree.PytreeNode):
         "dipgam",
         "quadgam"
     ]
-    def __init__(self, mol, param, cn_weights=None): # pylint: disable=redefined-outer-name
+    def __init__(self, mol, param): # pylint: disable=redefined-outer-name
         self.EN   = util.load_unique_element_params(mol, param, "en", broadcast="atom")
         self.gam  = util.load_unique_element_params(mol, param, "gam", broadcast="shell")
         self.gam3 = util.load_unique_element_params(mol, param, "gam3", broadcast="atom")
@@ -223,7 +223,7 @@ class GFN1MolParam(pytree.PytreeNode):
 
         self.kf = param.kf
         self.kEN = param.kEN
-        self.CN = cn_d3(mol, kcn=param.kcn_d3, weights=cn_weights)
+        self.CN = cn_d3(mol, kcn=param.kcn_d3)
 
         self.dipgam = None
         self.quadgam = None
