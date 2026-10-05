@@ -152,6 +152,11 @@ class XTB(ABC, SCFLite):
     def tot_electrons(self) -> int:
         return tot_valence_electrons(self.mol)
 
+    @property
+    def tot_charge(self) -> float:
+        """Target sum of the shell charges (used by the charge-Broyden solver)."""
+        return self.mol.charge
+
     def dip_moment(
         self,
         mol: MoleLite | None = None,
