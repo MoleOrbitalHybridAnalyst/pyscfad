@@ -58,6 +58,32 @@ def EHT_PI_GFN1(
     PI = (1 + shpoly[None,:,None] * RR) * (1 + shpoly[None,None,:] * RR)
     return PI
 
+def offsite_shell_pairs_lat(cell: Cell, Ls: ArrayLike) -> Array:
+    """``(nL, nbas, nbas)`` mask of the shell pairs that are off-site in the lattice sum.
+
+    Shells on different atoms, and shells of an atom and its own periodic image
+    (``L != 0``), are off-site; only the pairs of the same atom in the home cell
+    (``L = 0``) are on-site. This makes the lattice sums independent of the choice
+    of unit cell (e.g., primitive cell vs. supercell), as in tblite.
+    """
+    home = np.all(np.asarray(Ls).reshape(-1,3) == 0, axis=1)
+    distinct = util.mask_atom_pairs(cell)
+    pairs = util.mask_atom_pairs(cell, exclude_diag=False)
+    mask = np.where(home[:,None,None], distinct[None], pairs[None])
+    i, j = util.atom_to_bas_indices_2d(cell)
+    return mask[:,i,j]
+
+def EHT_X_GFN1_lat(cell: Cell, param: Any) -> Array:
+    """Electronegativity factor of :func:`pyscfad.xtb.xtb.EHT_X_GFN1`, also for the
+    pairs of an atom with its own periodic images (``X = 1``)."""
+    EN = param.EN
+    EN_AB = EN[:,None] - EN[None,:]
+    X = np.where(util.mask_atom_pairs(cell, exclude_diag=False),
+                 1. + param.kEN * EN_AB * EN_AB,
+                 0.)
+    return X[util.atom_to_bas_indices_2d(cell)]
+
+
 def mulliken_charge(
     cell: Cell,
     param: Any,
@@ -379,16 +405,13 @@ class GFN1KXTB(KXTB, xtb.GFN1XTB):
 
         mask = util.mask_valence_shell_gfn1(cell)
         hscale = np.where(np.outer(mask, mask),
-                          param.k_shlpr * param.kpair * xtb.EHT_X_GFN1(cell, param),
+                          param.k_shlpr * param.kpair * EHT_X_GFN1_lat(cell, param),
                           param.k_shlpr)
 
         hdiag = xtb.EHT_Hdiag_GFN1(cell, param)
-        mask = util.mask_atom_pairs(cell)[util.atom_to_bas_indices_2d(cell)]
-
-        nL = len(Ls)
-        h1 = np.where(np.repeat(mask[None,:,:], nL, axis=0),
+        h1 = np.where(offsite_shell_pairs_lat(cell, Ls),
                       hscale[None,:,:] * EHT_PI_GFN1(cell, param, Ls=Ls) * hdiag[None,:,:],
-                      np.repeat(hdiag[None,:,:], nL, axis=0))
+                      hdiag[None,:,:])
         h1 = np.asarray(h1, dtype=np.floatx)
 
         i, j = util.bas_to_ao_indices_2d(cell)

@@ -73,7 +73,7 @@ def test_gfn1_kxtb_energy_force_with_kpts_sample(setup):
 
     # reference with periodic coordination numbers (cn_d3 over cell.Ls);
     # forces vanish by symmetry for the ideal diamond structure
-    e0 = -3.83117442207487
+    e0 = -3.62605206380876
     g0 = np.zeros((2, 3))
 
     e1, g1 = jax.value_and_grad(cell_energy)(coords)
@@ -205,7 +205,7 @@ def test_gfn1_kxtb_energy_force_fp32(run_fp32):
                               [2.6935121974, 0.0, 2.6935121974],
                               [2.6935121974, 2.6935121974, 0.0]]) / BOHR),
             "sigma": None,
-            "e0": -3.83117442207487,
+            "e0": -3.62605206380876,
         },
         "cu": {
             "numbers": [29, 29],
@@ -217,7 +217,7 @@ def test_gfn1_kxtb_energy_force_fp32(run_fp32):
                  [0.        , 4.81045737, 0.        ],
                  [0.        , 0.        , 6.80301405],]),
             "sigma": 0.001,
-            "e0": -9.22283523848542,
+            "e0": -9.066494431417272,
         },
     }
 
@@ -259,7 +259,7 @@ def test_gfn1_kxtb_smearing(setup):
         mf.diis_space = 6
         return mf.kernel()
 
-    e0 = -9.22283523848542
+    e0 = -9.066494431417272
     g0 = np.zeros((2,3))
 
     e1, g1 = jax.value_and_grad(cell_energy)(coords)
@@ -297,3 +297,46 @@ def test_gfn1_kxtb_charged_kpts_qbroyden(setup):
     e1, conv = energy("qbroyden")
     assert conv
     assert abs(e1 - e0) < 1e-8
+
+def test_gfn1_kxtb_supercell_consistency(setup):
+    """A primitive cell with 2 k-points and the 2x1x1 supercell at Gamma describe the
+    same crystal, so E(supercell) = 2 E(primitive). The short (6 Bohr) lattice vector
+    makes the pairs of an atom with its own periodic images matter; these pairs are
+    off-site, as the corresponding pairs of different atoms in the supercell. The
+    charged case also checks the per-cell charge (cell.charge is that of the k-point
+    supercell, so both cells carry charge 2)."""
+    import numpy
+    basis, param = setup
+    numbers = numpy.array([8, 1, 1, 1])
+    coords = numpy.array([[0., 0., 0.], [1.43355, 0., -0.95296],
+                          [1.43355, 0., 0.95296], [-0.8, 0.1, 1.6]])
+    a_prim = numpy.diag([6., 9., 9.])
+    a_super = numpy.diag([12., 9., 9.])
+    shift = numpy.array([6., 0., 0.])
+    rcut, precision = 16., 1e-8
+
+    def energy(numbers, coords, a, charge, kmesh):
+        cell0 = Cell(numbers=numbers, coords=coords, a=a, basis=basis, rcut=rcut,
+                     precision=precision)
+        nimgs = tuple(int(x) for x in cell0.nimgs)
+        mesh = tuple(int(x) for x in cell0.cutoff_to_mesh(
+            ke_cutoff_ewald(GFN1KXTB.ewald_alpha, precision * cell0.vol)))
+        kpts = cell0.make_kpts(kmesh)
+
+        @jax.jit
+        def e():
+            cell = Cell(numbers=numbers, coords=coords, a=a, basis=basis, rcut=rcut,
+                        nimgs=nimgs, precision=precision, charge=charge)
+            mf = GFN1KXTB(cell, param=param, kpts=kpts)
+            mf.ewald_mesh = mesh
+            mf.diis = "anderson"
+            mf.conv_tol = 1e-12
+            return mf.kernel()
+        return e()
+
+    for natm, charge in ((3, 0), (4, 2)):   # H2O, H3O+
+        n, c = numbers[:natm], coords[:natm]
+        e_prim = energy(n, c, a_prim, charge, [2, 1, 1])
+        e_super = energy(numpy.hstack([n, n]), numpy.vstack([c, c + shift]),
+                         a_super, charge, [1, 1, 1])
+        assert abs(e_super - 2 * e_prim) < 1e-6
