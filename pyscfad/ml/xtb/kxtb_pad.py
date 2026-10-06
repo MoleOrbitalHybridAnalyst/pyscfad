@@ -158,18 +158,15 @@ class GFN1KXTB(kxtb.GFN1KXTB, KXTB):
         mask = util.mask_valence_shell_gfn1(cell)
         hscale = np.where(
             np.outer(mask, mask),
-            param.k_shlpr * param.kpair * xtb.EHT_X_GFN1(cell, param),
+            param.k_shlpr * param.kpair * kxtb.EHT_X_GFN1_lat(cell, param),
             param.k_shlpr,
         )
 
         hdiag = xtb.EHT_Hdiag_GFN1(cell, param)
-        pair_mask = util.mask_atom_pairs(cell)[util.atom_to_bas_indices_2d(cell)]
-
-        nL = len(Ls)
         h1 = np.where(
-            np.repeat(pair_mask[None, :, :], nL, axis=0),
+            kxtb.offsite_shell_pairs_lat(cell, Ls),
             hscale[None, :, :] * EHT_PI_GFN1(cell, param, Ls=Ls) * hdiag[None, :, :],
-            np.repeat(hdiag[None, :, :], nL, axis=0),
+            hdiag[None, :, :],
         )
 
         shl_mask = self.cell.shl_mask

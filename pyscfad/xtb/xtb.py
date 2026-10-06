@@ -154,7 +154,7 @@ class XTB(ABC, SCFLite):
 
     @property
     def tot_charge(self) -> float:
-        """Target sum of the shell charges."""
+        """Target sum of the shell charges (used by the charge-Broyden solver)."""
         return self.mol.charge
 
     def mask_ao_pairs(self, a: Array) -> Array:
