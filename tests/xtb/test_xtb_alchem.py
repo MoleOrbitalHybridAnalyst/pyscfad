@@ -434,3 +434,42 @@ def test_alchem_proton_kxtb_small_cell(setup):
         am[i, j] -= h
         fd = (energy(.4, ap) - energy(.4, am)) / (2 * h)
         assert abs(g[i, j] - fd) < 1e-6
+
+def test_alchem_proton_kxtb_supercell_consistency(setup):
+    """Primitive cell with 2 k-points vs. the 2x1x1 supercell at Gamma (two alchemical
+    protons sharing lam): E and dE/dlam of the supercell are twice those of the
+    primitive cell. In the primitive cell the proton pairs with its own periodic
+    images; in the supercell these are pairs of two alchemical protons. Treating the
+    self-image pairs like on-site pairs (unscaled overlap) instead would change
+    dE/dlam by 1e-5."""
+    basis, param, numbers, coords = setup
+    a_prim = numpy.diag([6., 9., 9.])
+    a_super = numpy.diag([12., 9., 9.])
+    shift = numpy.array([6., 0., 0.])
+    rcut, precision = 16., 1e-8
+
+    def energy_and_grad(numbers, coords, a, kmesh, alchem_atoms):
+        cell0 = Cell(numbers=numbers, coords=coords, a=a, basis=basis, rcut=rcut,
+                     precision=precision)
+        cell_kw = {"a": a, "basis": basis, "rcut": rcut, "precision": precision,
+                   "nimgs": tuple(int(x) for x in cell0.nimgs)}
+        mesh = tuple(int(x) for x in cell0.cutoff_to_mesh(
+            ke_cutoff_ewald(GFN1KXTB.ewald_alpha, precision * cell0.vol)))
+        kpts = cell0.make_kpts(kmesh)
+
+        def energy(lam):
+            # supercell charge 2 in both cases: one H3O+ per primitive cell
+            cell = Cell(numbers=numbers, coords=coords, charge=2, **cell_kw)
+            mf = AlchemGFN1KXTB(cell, param, lam=lam, alchem_atoms=alchem_atoms, kpts=kpts)
+            mf.ewald_mesh = mesh
+            mf.diis = "anderson"
+            mf.conv_tol = 1e-12
+            return mf.kernel()
+        return jax.jit(jax.value_and_grad(energy))(0.4)
+
+    e_prim, g_prim = energy_and_grad(numbers, coords, a_prim, [2, 1, 1], (3,))
+    e_super, g_super = energy_and_grad(numpy.hstack([numbers, numbers]),
+                                       numpy.vstack([coords, coords + shift]),
+                                       a_super, [1, 1, 1], (3, 7))
+    assert abs(e_super - 2 * e_prim) < 1e-6
+    assert abs(g_super - 2 * g_prim) < 1e-6
